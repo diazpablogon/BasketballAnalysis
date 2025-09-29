@@ -19,7 +19,6 @@ BOX_ENDPOINTS = [
     ("boxscore_misc_v2", "BoxScoreMiscV2"),
     ("boxscore_usage_v2", "BoxScoreUsageV2"),
     ("boxscore_scoring_v2", "BoxScoreScoringV2"),
-    ("boxscore_playertrack_v2", "BoxScorePlayerTrackV2"),
     ("boxscore_matchups_v3", "BoxScoreMatchupsV3"),
     ("boxscore_summary_v2", "BoxScoreSummaryV2"),
     # OJO: NO incluimos "BoxScoreSimilarityScore"
