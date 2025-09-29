@@ -64,14 +64,31 @@ def fetch_endpoint_df(endpoint_class_name: str, game_id: str, max_retries: int =
     logging.error(f"No se pudo descargar {endpoint_class_name} para {game_id}")
     return pd.DataFrame()
 
-def save_parquet(df: pd.DataFrame, path: str, season: str, game_id: str, endpoint_slug: str):
-    """Guarda el DataFrame en parquet, creando carpetas si hace falta."""
-    if df.empty:
-        logging.warning(f"DF vacío en {endpoint_slug} {game_id}, guardando placeholder igualmente")
-    df = df.copy()
-    df["season"] = season
-    df["game_id"] = game_id
-    df["endpoint"] = endpoint_slug
+def save_parquet(
+    df: pd.DataFrame,
+    path: str,
+    season: str,
+    game_id: str,
+    endpoint_slug: str,
+):
+    """Guarda el DataFrame en parquet y devuelve metadatos útiles sobre la operación."""
+
+    was_empty = df.empty
+    if was_empty:
+        logging.warning(
+            f"DF vacío en {endpoint_slug} {game_id}, guardando placeholder igualmente"
+        )
+
+    df_to_save = df.copy()
+    df_to_save["season"] = season
+    df_to_save["game_id"] = game_id
+    df_to_save["endpoint"] = endpoint_slug
+
     os.makedirs(os.path.dirname(path), exist_ok=True)
-    df.to_parquet(path, index=False)
-    logging.info(f"[OK] Guardado {path}")
+    df_to_save.to_parquet(path, index=False)
+
+    return {
+        "path": path,
+        "rows": len(df_to_save),
+        "was_empty": was_empty,
+    }
