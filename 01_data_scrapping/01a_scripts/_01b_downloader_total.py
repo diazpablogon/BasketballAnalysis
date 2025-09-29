@@ -1,6 +1,8 @@
 import os
 import sys
+import time
 import subprocess
+
 
 # ==============================
 # CONFIG RÁPIDA (edítala tú)
@@ -49,14 +51,39 @@ TASKS = [
 
 THIS_DIR = os.path.dirname(os.path.abspath(__file__))
 
+
 def _script_abs_path(rel_path: str) -> str:
     return os.path.join(THIS_DIR, rel_path)
+
+
+def _format_command(cmd) -> str:
+    return " ".join(cmd)
+
+
+def _print_task_header(task_name: str, cmd):
+    command_str = _format_command(cmd)
+    header = f"▶ {task_name}"
+    line_length = max(len(header), len(command_str) + 10, 70)
+    border = "─" * line_length
+    print("\n" + border)
+    print(header)
+    print(f"   comando: {command_str}")
+    print(border)
+    return line_length
+
+
+def _print_task_footer(status: str, duration: float, message: str = "", *, line_length: int = 70):
+    icon = "✅" if status == "ok" else "⚠️"
+    label = message.strip() if message else ("OK" if status == "ok" else "Error")
+    print(f"   {icon} {label} (t={duration:.1f}s)")
+    print("─" * line_length)
+
 
 def _run_task(task):
     script_path = _script_abs_path(task["rel_path"])
     if not os.path.exists(script_path):
         print(f"❌ No encontrado: {script_path}  (task: {task['name']})")
-        return
+        return {"name": task["name"], "status": "missing", "duration": 0.0}
 
     # Construye los argumentos estándar esperados por tus scripts
     cmd = [
@@ -72,27 +99,60 @@ def _run_task(task):
     # Extra args específicos del task (si los tuviera)
     cmd.extend(task.get("extra_args", []))
 
-    print(f"\n▶ Ejecutando: {task['name']}")
-    print("   ", " ".join(cmd))
-
+    line_length = _print_task_header(task["name"], cmd)
+    start = time.time()
     try:
         # check=True para que levante excepción si devuelve código != 0
         subprocess.run(cmd, check=True)
-        print(f"✅ OK: {task['name']}")
+        duration = time.time() - start
+        _print_task_footer("ok", duration, task["name"], line_length=line_length)
+        return {"name": task["name"], "status": "ok", "duration": duration}
     except subprocess.CalledProcessError as e:
-        print(f"⚠ Error ejecutando {task['name']} (exit code {e.returncode})")
+        duration = time.time() - start
+        _print_task_footer(
+            "error",
+            duration,
+            f"Error en {task['name']} (exit code {e.returncode})",
+            line_length=line_length,
+        )
+        return {"name": task["name"], "status": "error", "duration": duration}
     except Exception as e:
-        print(f"⚠ Excepción en {task['name']}: {e}")
+        duration = time.time() - start
+        _print_task_footer(
+            "error",
+            duration,
+            f"Excepción en {task['name']}: {e}",
+            line_length=line_length,
+        )
+        return {"name": task["name"], "status": "error", "duration": duration}
 
 def main():
-    print("=== Downloader TOTAL ===")
-    print(f"Temporadas: {SEASONS} | Playoffs: {INCLUDE_PLAYOFFS} | sleep={SLEEP}s | retries={MAX_RETRIES}")
+    enabled_tasks = [task for task in TASKS if task.get("enabled", False)]
 
+    print("╔════════════════════════════════════════════════════╗")
+    print("║               Downloader TOTAL NBA                 ║")
+    print("╠════════════════════════════════════════════════════╣")
+    print(f"║ Temporadas: {SEASONS:<35}║")
+    print(f"║ Playoffs: {str(INCLUDE_PLAYOFFS):<36}║")
+    print(f"║ sleep={SLEEP}s | retries={MAX_RETRIES:<22}║")
+    print(f"║ Tareas activas: {len(enabled_tasks)}/{len(TASKS):<29}║")
+    print("╚════════════════════════════════════════════════════╝")
+
+    results = []
     for task in TASKS:
         if task.get("enabled", False):
-            _run_task(task)
+            result = _run_task(task)
+            if result is not None:
+                results.append(result)
         else:
             print(f"⏭  Saltado: {task['name']}")
+
+    if results:
+        print("\nResumen de tareas:")
+        for result in results:
+            icon = "✅" if result["status"] == "ok" else "⚠️"
+            duration = result.get("duration", 0.0)
+            print(f"  {icon} {result['name']} (t={duration:.1f}s)")
 
     print("\n✔ Fin de tareas.")
 
