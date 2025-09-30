@@ -30,7 +30,6 @@ TEAM_DASH_ENDPOINTS = [
     ("team_player_dashboard", "TeamPlayerDashboard"),
     ("team_player_on_off_details", "TeamPlayerOnOffDetails"),
     ("team_player_on_off_summary", "TeamPlayerOnOffSummary"),
-    ("team_vs_player", "TeamVsPlayer"),
     ("team_dash_lineups", "TeamDashLineups"),
     ("team_dash_pt_pass", "TeamDashPtPass"),
     ("team_dash_pt_reb", "TeamDashPtReb"),

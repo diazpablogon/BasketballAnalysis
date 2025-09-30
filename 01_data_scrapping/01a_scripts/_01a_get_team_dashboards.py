@@ -262,6 +262,7 @@ def process_season(
                                     "rel_path": rel_path,
                                 }
                             )
+                            time.sleep(0.4)
                             continue
 
                         result = save_parquet(
@@ -284,6 +285,8 @@ def process_season(
                                 "rel_path": rel_path,
                             }
                         )
+                        time.sleep(0.4)
+
             except Exception as exc:  # pragma: no cover - safe-guarding runtime errors
                 logger.error(
                     (
