@@ -1,5 +1,6 @@
 import os
 import time
+import inspect
 import logging
 import pandas as pd
 
@@ -43,17 +44,64 @@ def _get_endpoint_class(class_name: str):
     """Devuelve la clase del endpoint si existe en nba_api, o None si no está disponible."""
     return getattr(ep, class_name, None)
 
+
+def _call_ep(ep_cls, **kwargs):
+    """Invoca un endpoint de ``nba_api`` adaptando parámetros con sufijo ``_nullable``.
+
+    Distintas versiones de la librería aceptan variaciones en los nombres de los
+    parámetros. Este helper revisa la signatura de ``ep_cls`` y reubica las
+    claves ``season``, ``season_type`` y ``team_id`` en su equivalente aceptado
+    por la clase (``*_nullable`` o ``season_type_all_star``) antes de realizar
+    la llamada.
+    """
+
+    signature = inspect.signature(ep_cls.__init__)
+    parameters = signature.parameters
+    accepts_var_kw = any(param.kind == inspect.Parameter.VAR_KEYWORD for param in parameters.values())
+
+    aliases = {
+        "season": ("season", "season_nullable"),
+        "season_type": ("season_type", "season_type_nullable", "season_type_all_star"),
+        "team_id": ("team_id", "team_id_nullable"),
+    }
+
+    final_kwargs = {}
+
+    for key, value in kwargs.items():
+        if key in parameters:
+            final_kwargs[key] = value
+            continue
+
+        matched = False
+        for canonical, options in aliases.items():
+            if key == canonical or key in options:
+                for candidate in options:
+                    if candidate in parameters:
+                        final_kwargs[candidate] = value
+                        matched = True
+                        break
+                if matched:
+                    break
+
+        if matched:
+            continue
+
+        if accepts_var_kw:
+            final_kwargs[key] = value
+
+    return ep_cls(**final_kwargs)
+
 def list_game_ids(season: str, include_playoffs: bool = False):
     """Devuelve todos los GAME_ID de una temporada."""
     game_ids = []
 
     # Regular Season
-    reg = LeagueGameLog(season=season, season_type_all_star=SeasonTypeAllStar.regular)
+    reg = _call_ep(LeagueGameLog, season=season, season_type=SeasonTypeAllStar.regular)
     df_reg = reg.get_data_frames()[0]
     game_ids.extend(df_reg["GAME_ID"].unique())
 
     if include_playoffs:
-        po = LeagueGameLog(season=season, season_type_all_star=SeasonTypeAllStar.playoffs)
+        po = _call_ep(LeagueGameLog, season=season, season_type=SeasonTypeAllStar.playoffs)
         df_po = po.get_data_frames()[0]
         game_ids.extend(df_po["GAME_ID"].unique())
 
@@ -111,16 +159,11 @@ def fetch_team_endpoint_tables(
 
     for attempt in range(max_retries):
         try:
-            try:
-                resp = cls(
-                    season_type_all_star=season_type,
-                    **base_kwargs,
-                )
-            except TypeError:
-                resp = cls(
-                    season_type=season_type,
-                    **base_kwargs,
-                )
+            resp = _call_ep(
+                cls,
+                season_type=season_type,
+                **base_kwargs,
+            )
 
             tables = []
             for index, dataset in enumerate(getattr(resp, "data_sets", []) or []):
