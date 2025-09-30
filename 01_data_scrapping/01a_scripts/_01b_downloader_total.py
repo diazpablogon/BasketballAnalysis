@@ -9,7 +9,7 @@ import subprocess
 # ==============================
 
 # Temporadas a descargar (coma separadas)
-SEASONS = "2024-25"          # Ej: "2022-23,2023-24,2024-25"
+SEASONS = "2023-24"          # Ej: "2022-23,2023-24,2024-25"
 INCLUDE_PLAYOFFS = True      # True/False
 SLEEP = 0.8                  # segundos entre reintentos
 MAX_RETRIES = 3              # reintentos por endpoint
@@ -20,14 +20,14 @@ TASKS = [
     {
         "name": "Box Scores (todos los variantes)",
         "rel_path": "_01a_get_boxscores.py",
-        "enabled": True,
+        "enabled": False,
         "extra_args": []  # puedes poner más flags si tu script los admite
     },
 
     {
         "name": "Team Dashboards",
         "rel_path": "_01a_get_team_dashboards.py",
-        "enabled": False,
+        "enabled": True,
         "extra_args": [],
     },
 
