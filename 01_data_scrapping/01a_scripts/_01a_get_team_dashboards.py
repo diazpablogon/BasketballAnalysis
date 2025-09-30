@@ -4,10 +4,10 @@ import argparse
 import logging
 
 from nba_api.stats.library.parameters import SeasonTypeAllStar
+from nba_api.stats.static import teams as static_teams
 
 from _01a_function_tools import (
     TEAM_DASH_ENDPOINTS,
-    list_team_ids,
     fetch_team_endpoint_tables,
     save_parquet,
 )
@@ -96,7 +96,11 @@ def process_season(
     sleep: float = 0.8,
     max_retries: int = 3,
 ):
-    team_ids = sorted(list_team_ids())
+    team_ids = sorted(
+        team["id"]
+        for team in static_teams.get_teams()
+        if team.get("is_nba_team")
+    )
     if not team_ids:
         logger.warning("No se encontraron equipos NBA para procesar")
         return
