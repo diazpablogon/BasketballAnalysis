@@ -20,14 +20,14 @@ TASKS = [
     {
         "name": "Box Scores (todos los variantes)",
         "rel_path": "_01a_get_boxscores.py",
-        "enabled": True,
+        "enabled": False,
         "extra_args": []  # puedes poner más flags si tu script los admite
     },
 
     {
         "name": "Team Dashboards",
         "rel_path": "_01a_get_team_dashboards.py",
-        "enabled": False,
+        "enabled": True,
         "extra_args": [],
     },
 

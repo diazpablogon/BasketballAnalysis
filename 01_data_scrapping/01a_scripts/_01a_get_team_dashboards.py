@@ -96,11 +96,8 @@ def process_season(
     sleep: float = 0.8,
     max_retries: int = 3,
 ):
-    team_ids = sorted(
-        team["id"]
-        for team in static_teams.get_teams()
-        if team.get("is_nba_team")
-    )
+    teams_list = static_teams.get_teams()  # ya devuelve los 30 equipos actuales
+    team_ids = sorted(team["id"] for team in teams_list)
     if not team_ids:
         logger.warning("No se encontraron equipos NBA para procesar")
         return
