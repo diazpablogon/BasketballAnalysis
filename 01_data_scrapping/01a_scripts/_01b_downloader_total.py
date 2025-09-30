@@ -24,6 +24,13 @@ TASKS = [
         "extra_args": []  # puedes poner más flags si tu script los admite
     },
 
+    {
+        "name": "Team Dashboards",
+        "rel_path": "_01a_get_team_dashboards.py",
+        "enabled": False,
+        "extra_args": [],
+    },
+
     # ======= EJEMPLOS para cuando los tengas listos =======
     # {
     #     "name": "Play-by-Play",
