@@ -11,8 +11,8 @@ from typing import Optional
 
 # Temporadas a descargar (coma separadas)
 SEASONS = "2024-25"          # Ej: "2022-23,2023-24,2024-25"
-INCLUDE_PLAYOFFS = True      # True/False cuando se procesan RS+PO
-PLAYOFFS_ONLY = False        # Ignora Regular Season y descarga solo Playoffs
+INCLUDE_PLAYOFFS = False      # True/False cuando se procesan RS+PO
+PLAYOFFS_ONLY = True        # Ignora Regular Season y descarga solo Playoffs
 REGULAR_ONLY = False         # Ignora Playoffs
 PLAYOFFS_FILTER = "auto"     # auto / all → ver script de dashboards
 SLEEP = 0.8                  # segundos entre reintentos
