@@ -2,6 +2,7 @@ import os
 import sys
 import time
 import subprocess
+from typing import Optional
 
 
 # ==============================
@@ -9,8 +10,11 @@ import subprocess
 # ==============================
 
 # Temporadas a descargar (coma separadas)
-SEASONS = "2023-24"          # Ej: "2022-23,2023-24,2024-25"
-INCLUDE_PLAYOFFS = True      # True/False
+SEASONS = "2024-25"          # Ej: "2022-23,2023-24,2024-25"
+INCLUDE_PLAYOFFS = False      # True/False cuando se procesan RS+PO
+PLAYOFFS_ONLY = True        # Ignora Regular Season y descarga solo Playoffs
+REGULAR_ONLY = False         # Ignora Playoffs
+PLAYOFFS_FILTER = "auto"     # auto / all → ver script de dashboards
 SLEEP = 0.8                  # segundos entre reintentos
 MAX_RETRIES = 3              # reintentos por endpoint
 
@@ -67,30 +71,32 @@ def _format_command(cmd) -> str:
     return " ".join(cmd)
 
 
-def _print_task_header(task_name: str, cmd):
-    command_str = _format_command(cmd)
-    header = f"▶ {task_name}"
-    line_length = max(len(header), len(command_str) + 10, 70)
-    border = "─" * line_length
-    print("\n" + border)
-    print(header)
-    print(f"   comando: {command_str}")
-    print(border)
-    return line_length
-
-
-def _print_task_footer(status: str, duration: float, message: str = "", *, line_length: int = 70):
-    icon = "✅" if status == "ok" else "⚠️"
-    label = message.strip() if message else ("OK" if status == "ok" else "Error")
-    print(f"   {icon} {label} (t={duration:.1f}s)")
-    print("─" * line_length)
+def _print_task(status: str, name: str, secs: float, note: Optional[str] = None):
+    icons = {
+        "ok": "✅",
+        "skipped": "⏭️",
+        "error": "❌",
+        "warn": "⚠️",
+        "running": "⏱️",
+    }
+    icon = icons.get(status, "•")
+    base = f"{icon} {name}"
+    base += f" ({secs:.1f}s)"
+    if note:
+        base += f" — {note}"
+    print(base)
 
 
 def _run_task(task):
     script_path = _script_abs_path(task["rel_path"])
     if not os.path.exists(script_path):
-        print(f"❌ No encontrado: {script_path}  (task: {task['name']})")
-        return {"name": task["name"], "status": "missing", "duration": 0.0}
+        return {
+            "name": task["name"],
+            "status": "error",
+            "duration": 0.0,
+            "note": f"script no encontrado: {script_path}",
+            "command": "",
+        }
 
     # Construye los argumentos estándar esperados por tus scripts
     cmd = [
@@ -100,66 +106,105 @@ def _run_task(task):
         "--sleep", str(SLEEP),
         "--max-retries", str(MAX_RETRIES),
     ]
-    if INCLUDE_PLAYOFFS:
+
+    if task.get("rel_path") == "_01a_get_team_dashboards.py":
+        if PLAYOFFS_ONLY:
+            cmd.append("--playoffs-only")
+        elif REGULAR_ONLY:
+            cmd.append("--regular-only")
+        elif INCLUDE_PLAYOFFS:
+            cmd.append("--include-playoffs")
+        else:
+            # Solo Regular Season por omisión
+            pass
+
+        cmd.extend(["--playoffs-filter", PLAYOFFS_FILTER])
+    elif INCLUDE_PLAYOFFS:
         cmd.append("--include-playoffs")
 
     # Extra args específicos del task (si los tuviera)
     cmd.extend(task.get("extra_args", []))
 
-    line_length = _print_task_header(task["name"], cmd)
     start = time.time()
+    command_str = _format_command(cmd)
     try:
         # check=True para que levante excepción si devuelve código != 0
         subprocess.run(cmd, check=True)
         duration = time.time() - start
-        _print_task_footer("ok", duration, task["name"], line_length=line_length)
-        return {"name": task["name"], "status": "ok", "duration": duration}
+        return {
+            "name": task["name"],
+            "status": "ok",
+            "duration": duration,
+            "note": "",
+            "command": command_str,
+        }
     except subprocess.CalledProcessError as e:
         duration = time.time() - start
-        _print_task_footer(
-            "error",
-            duration,
-            f"Error en {task['name']} (exit code {e.returncode})",
-            line_length=line_length,
-        )
-        return {"name": task["name"], "status": "error", "duration": duration}
+        return {
+            "name": task["name"],
+            "status": "error",
+            "duration": duration,
+            "note": f"exit code {e.returncode}",
+            "command": command_str,
+        }
     except Exception as e:
         duration = time.time() - start
-        _print_task_footer(
-            "error",
-            duration,
-            f"Excepción en {task['name']}: {e}",
-            line_length=line_length,
-        )
-        return {"name": task["name"], "status": "error", "duration": duration}
+        return {
+            "name": task["name"],
+            "status": "error",
+            "duration": duration,
+            "note": f"excepción: {e}",
+            "command": command_str,
+        }
 
 def main():
     enabled_tasks = [task for task in TASKS if task.get("enabled", False)]
 
-    print("╔════════════════════════════════════════════════════╗")
-    print("║               Downloader TOTAL NBA                 ║")
-    print("╠════════════════════════════════════════════════════╣")
-    print(f"║ Temporadas: {SEASONS:<35}║")
-    print(f"║ Playoffs: {str(INCLUDE_PLAYOFFS):<36}║")
-    print(f"║ sleep={SLEEP}s | retries={MAX_RETRIES:<22}║")
-    print(f"║ Tareas activas: {len(enabled_tasks)}/{len(TASKS):<29}║")
-    print("╚════════════════════════════════════════════════════╝")
+    if PLAYOFFS_ONLY and REGULAR_ONLY:
+        print("❌ Configuración inválida: PLAYOFFS_ONLY y REGULAR_ONLY no pueden ser verdaderos a la vez")
+        return
+
+    print("Downloader TOTAL NBA")
+    print(f"Temporadas: {SEASONS}")
+    print(
+        "Opciones: include_playoffs={include} · playoffs_only={po} · regular_only={ro} · filter={flt}".format(
+            include=INCLUDE_PLAYOFFS,
+            po=PLAYOFFS_ONLY,
+            ro=REGULAR_ONLY,
+            flt=PLAYOFFS_FILTER,
+        )
+    )
+    print(f"sleep={SLEEP}s · retries={MAX_RETRIES} · tareas activas={len(enabled_tasks)}/{len(TASKS)}\n")
 
     results = []
+    skipped = 0
+
     for task in TASKS:
         if task.get("enabled", False):
             result = _run_task(task)
-            if result is not None:
-                results.append(result)
+            results.append(result)
+            status = result.get("status", "error")
+            note = result.get("note") or ""
+            command = result.get("command")
+            if status == "error" and command:
+                note = f"{note} · {command}" if note else command
+            _print_task(status, task["name"], result.get("duration", 0.0), note or None)
         else:
-            print(f"⏭  Saltado: {task['name']}")
+            skipped += 1
+            _print_task("skipped", task["name"], 0.0, "deshabilitada")
 
-    if results:
-        print("\nResumen de tareas:")
-        for result in results:
-            icon = "✅" if result["status"] == "ok" else "⚠️"
-            duration = result.get("duration", 0.0)
-            print(f"  {icon} {result['name']} (t={duration:.1f}s)")
+    completed = sum(1 for result in results if result.get("status") == "ok")
+    failed = sum(1 for result in results if result.get("status") == "error")
+    warned = sum(1 for result in results if result.get("status") == "warn")
+    total_duration = sum(result.get("duration", 0.0) for result in results)
+
+    print("\nResumen:")
+    print(f"  ✅ completadas: {completed}")
+    if warned:
+        print(f"  ⚠️ con avisos: {warned}")
+    print(f"  ❌ fallidas: {failed}")
+    print(f"  ⏭️ saltadas: {skipped}")
+    print(f"  ⏱️ tiempo total: {total_duration:.1f}s")
 
     print("\n✔ Fin de tareas.")
 

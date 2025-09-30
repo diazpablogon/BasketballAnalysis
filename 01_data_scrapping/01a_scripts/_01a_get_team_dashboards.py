@@ -3,14 +3,15 @@ import re
 import time
 import argparse
 import logging
-from typing import Dict, Optional
+from typing import Dict, Optional, Set
 
-from nba_api.stats.endpoints import LeagueGameLog
+from nba_api.stats.endpoints import LeagueGameFinder, LeagueGameLog, TeamGameLogs
 from nba_api.stats.library.parameters import SeasonTypeAllStar
 from nba_api.stats.static import teams as static_teams
 
 from _01a_function_tools import (
     TEAM_DASH_ENDPOINTS,
+    _call_ep,
     fetch_team_endpoint_tables,
     save_parquet,
 )
@@ -104,10 +105,11 @@ def has_playoff_games(
 
     for attempt in range(max_retries):
         try:
-            response = LeagueGameLog(
+            response = _call_ep(
+                LeagueGameLog,
                 season=season,
-                season_type_all_star=SeasonTypeAllStar.playoffs,
-                team_id_nullable=team_id,
+                season_type=SeasonTypeAllStar.playoffs,
+                team_id=team_id,
                 player_or_team="T",
             )
             data_frames = response.get_data_frames()
@@ -141,9 +143,71 @@ def has_playoff_games(
     return None
 
 
+def get_playoff_teams(
+    *, season: str, max_retries: int = 3, delay: float = 0.8
+) -> Optional[Set[int]]:
+    """Devuelve los equipos que jugaron playoffs en la temporada."""
+
+    probes = [
+        ("TeamGameLogs", TeamGameLogs, {"season": season, "season_type": "Playoffs"}),
+        (
+            "LeagueGameFinder",
+            LeagueGameFinder,
+            {"season": season, "season_type": "Playoffs", "player_or_team": "T"},
+        ),
+    ]
+
+    for name, endpoint_cls, params in probes:
+        for attempt in range(max_retries):
+            try:
+                response = _call_ep(endpoint_cls, **params)
+                get_frames = getattr(response, "get_data_frames", None)
+                data_frames = get_frames() if callable(get_frames) else []
+                if not data_frames:
+                    logger.info(
+                        "Sin datos en %s para %s (intento %s/%s)",
+                        name,
+                        season,
+                        attempt + 1,
+                        max_retries,
+                    )
+                    break
+
+                df = data_frames[0]
+                if "TEAM_ID" not in df.columns:
+                    logger.warning("%s devolvió datos sin TEAM_ID para %s", name, season)
+                    break
+
+                team_ids = {int(team_id) for team_id in df["TEAM_ID"].dropna().unique()}
+                return team_ids
+            except Exception as exc:  # pragma: no cover - fallos HTTP/red
+                if attempt < max_retries - 1:
+                    logger.warning(
+                        "Fallo en %s detectando playoffs (%s · intento %s/%s): %s",
+                        name,
+                        season,
+                        attempt + 1,
+                        max_retries,
+                        exc,
+                    )
+                    time.sleep(delay * (attempt + 1))
+                    continue
+
+                logger.error(
+                    "No se pudo determinar equipos de playoffs vía %s para %s: %s",
+                    name,
+                    season,
+                    exc,
+                )
+
+    return None
+
+
 def process_season(
     season: str,
+    include_regular: bool = True,
     include_playoffs: bool = False,
+    playoffs_filter: str = "auto",
     sleep: float = 0.8,
     max_retries: int = 3,
 ):
@@ -155,13 +219,29 @@ def process_season(
 
     team_lookup = {team["id"]: team for team in teams_list}
 
-    season_types = [SeasonTypeAllStar.regular]
+    season_types = []
+    if include_regular:
+        season_types.append(SeasonTypeAllStar.regular)
     if include_playoffs:
         season_types.append(SeasonTypeAllStar.playoffs)
 
     total_teams = len(team_ids)
     season_summaries: Dict[str, Dict[str, int]] = {}
     had_failures = False
+
+    if not include_regular:
+        season_summaries[SeasonTypeAllStar.regular] = {
+            "completed": 0,
+            "skipped_expected": 0,
+            "skipped_disabled": total_teams,
+            "failed": 0,
+        }
+        logger.info(
+            (
+                f"{season} ({SeasonTypeAllStar.regular}): tarea deshabilitada por el "
+                f"usuario → se omiten {total_teams} equipos"
+            )
+        )
 
     if not include_playoffs:
         season_summaries[SeasonTypeAllStar.playoffs] = {
@@ -177,6 +257,9 @@ def process_season(
             )
         )
 
+    playoff_team_ids: Optional[Set[int]] = None
+    playoff_detection_failed = False
+
     for season_type in season_types:
         counts = season_summaries.setdefault(
             season_type,
@@ -187,17 +270,55 @@ def process_season(
                 "failed": 0,
             },
         )
+        if season_type == SeasonTypeAllStar.playoffs and playoffs_filter == "auto":
+            if playoff_team_ids is None and not playoff_detection_failed:
+                playoff_team_ids = get_playoff_teams(
+                    season=season,
+                    max_retries=max_retries,
+                    delay=sleep,
+                )
+                if playoff_team_ids is None:
+                    playoff_detection_failed = True
+                    had_failures = True
+                    counts["failed"] += 1
+                    logger.error(
+                        "%s (Playoffs): no se pudieron detectar los equipos automáticamente; se procesarán los 30 equipos",
+                        season,
+                    )
+                else:
+                    logger.info(
+                        "%s (Playoffs): filtro auto → %s equipos con partidos de playoffs",
+                        season,
+                        len(playoff_team_ids),
+                    )
+
+            if not playoff_detection_failed and playoff_team_ids is not None:
+                if not playoff_team_ids:
+                    logger.info(
+                        "%s (Playoffs): filtro auto sin equipos → nada que procesar",
+                        season,
+                    )
+                    counts["skipped_expected"] = total_teams
+                    continue
+                season_team_ids = sorted(playoff_team_ids)
+            else:
+                season_team_ids = team_ids
+        else:
+            season_team_ids = team_ids
+
+        season_total = len(season_team_ids)
+
         logger.info(
-            f"{season} ({season_type}): procesando {total_teams} equipos · {len(TEAM_DASH_ENDPOINTS)} endpoints"
+            f"{season} ({season_type}): procesando {season_total} equipos · {len(TEAM_DASH_ENDPOINTS)} endpoints"
         )
 
         teams_with_new_data = 0
 
-        for index, team_id in enumerate(team_ids, start=1):
+        for index, team_id in enumerate(season_team_ids, start=1):
             team_info = team_lookup.get(team_id, {})
             team_name = team_info.get("full_name") or team_info.get("nickname") or f"TEAM_{team_id}"
 
-            if season_type == SeasonTypeAllStar.playoffs:
+            if season_type == SeasonTypeAllStar.playoffs and playoffs_filter == "all":
                 playoff_check = has_playoff_games(
                     team_id=team_id,
                     season=season,
@@ -262,7 +383,6 @@ def process_season(
                                     "rel_path": rel_path,
                                 }
                             )
-                            time.sleep(0.4)
                             continue
 
                         result = save_parquet(
@@ -285,8 +405,6 @@ def process_season(
                                 "rel_path": rel_path,
                             }
                         )
-                        time.sleep(0.4)
-
             except Exception as exc:  # pragma: no cover - safe-guarding runtime errors
                 logger.error(
                     (
@@ -313,7 +431,7 @@ def process_season(
                 season=season,
                 season_type=season_type,
                 team_index=index,
-                total_teams=total_teams,
+                total_teams=season_total,
                 team_id=team_id,
                 statuses=statuses,
                 teams_with_new_data=teams_with_new_data,
@@ -321,7 +439,7 @@ def process_season(
             counts["completed"] += 1
 
         logger.info(
-            f"{season} ({season_type}): etapa completada. Equipos procesados: {total_teams}. "
+            f"{season} ({season_type}): etapa completada. Equipos procesados: {season_total}. "
             f"Con nuevos datos en {teams_with_new_data} equipos."
         )
 
@@ -352,18 +470,44 @@ def main():
     )
     parser.add_argument("--seasons", required=True, help="Ej: '2023-24,2024-25'")
     parser.add_argument("--include-playoffs", action="store_true")
+    parser.add_argument("--playoffs-only", action="store_true")
+    parser.add_argument("--regular-only", action="store_true")
+    parser.add_argument(
+        "--playoffs-filter",
+        choices=["auto", "all"],
+        default="auto",
+        help="Modo de iteración de equipos en playoffs",
+    )
     parser.add_argument("--sleep", type=float, default=0.8)
     parser.add_argument("--max-retries", type=int, default=3)
     args = parser.parse_args()
 
     exit_code = 0
 
+    if args.playoffs_only and args.regular_only:
+        parser.error("No puedes combinar --playoffs-only y --regular-only")
+
     for season in (s.strip() for s in args.seasons.split(",")):
         if not season:
             continue
+        include_regular = True
+        include_playoffs = False
+
+        if args.regular_only:
+            include_regular = True
+            include_playoffs = False
+        elif args.playoffs_only:
+            include_regular = False
+            include_playoffs = True
+        else:
+            include_regular = True
+            include_playoffs = args.include_playoffs
+
         result = process_season(
             season=season,
-            include_playoffs=args.include_playoffs,
+            include_regular=include_regular,
+            include_playoffs=include_playoffs,
+            playoffs_filter=args.playoffs_filter,
             sleep=args.sleep,
             max_retries=args.max_retries,
         )
