@@ -120,11 +120,12 @@ def parse_args() -> argparse.Namespace:
             "Preprocess team dashboard general splits parquet files into a single league-wide file."
         )
     )
+    default_base = Path(__file__).resolve().parents[2]
     parser.add_argument(
         "--base_dir",
-        default=".",
+        default=default_base,
         type=Path,
-        help="Base directory of the repository (default: current directory)",
+        help="Base directory of the repository (default: repository root)",
     )
     parser.add_argument(
         "--season",
