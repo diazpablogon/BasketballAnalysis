@@ -42,6 +42,27 @@ def load_and_annotate_dataset(dataset_id: int, files: Iterable[Path]) -> pd.Data
     for path in files:
         df = pd.read_parquet(path)
         df = df.copy()
+
+        team_id_column = next((col for col in df.columns if col.lower() == "team_id"), None)
+        if team_id_column is not None:
+            if team_id_column != "TEAM_ID":
+                df = df.rename(columns={team_id_column: "TEAM_ID"})
+        else:
+            parts = path.stem.split("__")
+            if len(parts) < 3:
+                raise ValueError(
+                    "Unable to extract TEAM_ID from filename '"
+                    f"{path.name}'. Expected pattern "
+                    "'team_dashboard_by_general_splits__<TEAMID>__dataset_<id>.parquet'"
+                )
+            try:
+                team_id_value = int(parts[1])
+            except ValueError as exc:
+                raise ValueError(
+                    f"Extracted TEAM_ID '{parts[1]}' from filename '{path.name}' is not an integer"
+                ) from exc
+            df["TEAM_ID"] = team_id_value
+
         df["source_dataset"] = dataset_id
         df["split_type"] = split_type
 
