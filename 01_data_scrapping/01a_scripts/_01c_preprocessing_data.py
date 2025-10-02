@@ -17,6 +17,39 @@ SPLIT_CONFIG = {
     5: {"split_type": "team_days_rest_range", "split_value": ("column", "TEAM_DAYS_REST_RANGE")},
 }
 
+TEAM_ID_TO_NAME = {
+    1610612737: "Atlanta Hawks",
+    1610612738: "Boston Celtics",
+    1610612739: "Cleveland Cavaliers",
+    1610612740: "New Orleans Pelicans",
+    1610612741: "Chicago Bulls",
+    1610612742: "Dallas Mavericks",
+    1610612743: "Denver Nuggets",
+    1610612744: "Golden State Warriors",
+    1610612745: "Houston Rockets",
+    1610612746: "Los Angeles Clippers",
+    1610612747: "Los Angeles Lakers",
+    1610612748: "Miami Heat",
+    1610612749: "Milwaukee Bucks",
+    1610612750: "Minnesota Timberwolves",
+    1610612751: "Brooklyn Nets",
+    1610612752: "New York Knicks",
+    1610612753: "Orlando Magic",
+    1610612754: "Indiana Pacers",
+    1610612755: "Philadelphia 76ers",
+    1610612756: "Phoenix Suns",
+    1610612757: "Portland Trail Blazers",
+    1610612758: "Sacramento Kings",
+    1610612759: "San Antonio Spurs",
+    1610612760: "Oklahoma City Thunder",
+    1610612761: "Toronto Raptors",
+    1610612762: "Utah Jazz",
+    1610612763: "Memphis Grizzlies",
+    1610612764: "Washington Wizards",
+    1610612765: "Detroit Pistons",
+    1610612766: "Charlotte Hornets",
+}
+
 
 def discover_dataset_files(input_dir: Path) -> Dict[int, List[Path]]:
     """Discover parquet files for each dataset index within ``input_dir``."""
@@ -160,6 +193,13 @@ def preprocess(base_dir: Path, season: str, season_type: str) -> Path:
                 .set_index("TEAM_ID")["TEAM_NAME"]
             )
             combined["TEAM_NAME"] = combined["TEAM_ID"].map(name_lookup).fillna(combined["TEAM_NAME"])
+
+    if "TEAM_NAME" not in combined.columns:
+        combined["TEAM_NAME"] = pd.NA
+
+    combined["TEAM_NAME"] = combined["TEAM_NAME"].fillna(
+        combined["TEAM_ID"].map(TEAM_ID_TO_NAME)
+    )
 
     output_path = (
         base_dir
