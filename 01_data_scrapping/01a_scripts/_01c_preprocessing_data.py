@@ -17,6 +17,39 @@ SPLIT_CONFIG = {
     5: {"split_type": "team_days_rest_range", "split_value": ("column", "TEAM_DAYS_REST_RANGE")},
 }
 
+TEAM_ID_TO_NAME = {
+    1610612737: "Atlanta Hawks",
+    1610612738: "Boston Celtics",
+    1610612739: "Cleveland Cavaliers",
+    1610612740: "New Orleans Pelicans",
+    1610612741: "Chicago Bulls",
+    1610612742: "Dallas Mavericks",
+    1610612743: "Denver Nuggets",
+    1610612744: "Golden State Warriors",
+    1610612745: "Houston Rockets",
+    1610612746: "Los Angeles Clippers",
+    1610612747: "Los Angeles Lakers",
+    1610612748: "Miami Heat",
+    1610612749: "Milwaukee Bucks",
+    1610612750: "Minnesota Timberwolves",
+    1610612751: "Brooklyn Nets",
+    1610612752: "New York Knicks",
+    1610612753: "Orlando Magic",
+    1610612754: "Indiana Pacers",
+    1610612755: "Philadelphia 76ers",
+    1610612756: "Phoenix Suns",
+    1610612757: "Portland Trail Blazers",
+    1610612758: "Sacramento Kings",
+    1610612759: "San Antonio Spurs",
+    1610612760: "Oklahoma City Thunder",
+    1610612761: "Toronto Raptors",
+    1610612762: "Utah Jazz",
+    1610612763: "Memphis Grizzlies",
+    1610612764: "Washington Wizards",
+    1610612765: "Detroit Pistons",
+    1610612766: "Charlotte Hornets",
+}
+
 
 def discover_dataset_files(input_dir: Path) -> Dict[int, List[Path]]:
     """Discover parquet files for each dataset index within ``input_dir``."""
@@ -32,7 +65,11 @@ def discover_dataset_files(input_dir: Path) -> Dict[int, List[Path]]:
     return dataset_files
 
 
-def load_and_annotate_dataset(dataset_id: int, files: Iterable[Path]) -> pd.DataFrame:
+def load_and_annotate_dataset(
+    dataset_id: int,
+    files: Iterable[Path],
+    team_name_map: Dict[int, str] | None = None,
+) -> pd.DataFrame:
     """Load parquet files for ``dataset_id`` and add dataset metadata columns."""
     frames: List[pd.DataFrame] = []
     config = SPLIT_CONFIG[dataset_id]
@@ -44,9 +81,16 @@ def load_and_annotate_dataset(dataset_id: int, files: Iterable[Path]) -> pd.Data
         df = df.copy()
 
         team_id_column = next((col for col in df.columns if col.lower() == "team_id"), None)
+        team_id_value: int | None = None
         if team_id_column is not None:
             if team_id_column != "TEAM_ID":
                 df = df.rename(columns={team_id_column: "TEAM_ID"})
+            team_id_series = df["TEAM_ID"]
+            if team_id_series.nunique() == 1:
+                try:
+                    team_id_value = int(team_id_series.iloc[0])
+                except (TypeError, ValueError):
+                    team_id_value = None
         else:
             parts = path.stem.split("__")
             if len(parts) < 3:
@@ -62,6 +106,33 @@ def load_and_annotate_dataset(dataset_id: int, files: Iterable[Path]) -> pd.Data
                     f"Extracted TEAM_ID '{parts[1]}' from filename '{path.name}' is not an integer"
                 ) from exc
             df["TEAM_ID"] = team_id_value
+
+        if team_id_value is None:
+            team_id_series = df["TEAM_ID"]
+            if team_id_series.nunique() == 1:
+                try:
+                    team_id_value = int(team_id_series.iloc[0])
+                except (TypeError, ValueError):
+                    team_id_value = None
+
+        team_name_column = next((col for col in df.columns if col.lower() == "team_name"), None)
+        if team_name_column is not None:
+            if team_name_column != "TEAM_NAME":
+                df = df.rename(columns={team_name_column: "TEAM_NAME"})
+        elif "TEAM_NAME" not in df.columns:
+            df["TEAM_NAME"] = pd.NA
+
+        if team_id_value is not None and team_name_map is not None:
+            if "TEAM_NAME" in df.columns:
+                non_null_names = df["TEAM_NAME"].dropna().unique()
+                if len(non_null_names) == 1:
+                    team_name_map.setdefault(team_id_value, str(non_null_names[0]))
+                elif len(non_null_names) > 1:
+                    # Prefer the first non-null value when multiple names appear unexpectedly.
+                    team_name_map.setdefault(team_id_value, str(non_null_names[0]))
+            mapped_name = team_name_map.get(team_id_value)
+            if mapped_name is not None:
+                df["TEAM_NAME"] = mapped_name
 
         df["source_dataset"] = dataset_id
         df["split_type"] = split_type
@@ -98,15 +169,37 @@ def preprocess(base_dir: Path, season: str, season_type: str) -> Path:
 
     dataset_files = discover_dataset_files(input_dir)
 
-    dataframes = [
-        load_and_annotate_dataset(dataset_id, files)
-        for dataset_id, files in sorted(dataset_files.items())
-    ]
+    team_name_map: Dict[int, str] = {}
+    dataframes = []
+    for dataset_id, files in sorted(dataset_files.items()):
+        df = load_and_annotate_dataset(dataset_id, files, team_name_map=team_name_map)
+        dataframes.append(df)
 
     combined = pd.concat(dataframes, ignore_index=True, sort=False)
 
     if "TEAM_ID" not in combined.columns:
         raise KeyError("TEAM_ID column not found in combined dataframe")
+
+    if "TEAM_NAME" not in combined.columns:
+        combined["TEAM_NAME"] = pd.NA
+
+    if combined["TEAM_NAME"].isna().any():
+        if team_name_map:
+            combined["TEAM_NAME"] = combined["TEAM_ID"].map(team_name_map).fillna(combined["TEAM_NAME"])
+        else:
+            name_lookup = (
+                combined.loc[combined["TEAM_NAME"].notna(), ["TEAM_ID", "TEAM_NAME"]]
+                .drop_duplicates(subset="TEAM_ID")
+                .set_index("TEAM_ID")["TEAM_NAME"]
+            )
+            combined["TEAM_NAME"] = combined["TEAM_ID"].map(name_lookup).fillna(combined["TEAM_NAME"])
+
+    if "TEAM_NAME" not in combined.columns:
+        combined["TEAM_NAME"] = pd.NA
+
+    combined["TEAM_NAME"] = combined["TEAM_NAME"].fillna(
+        combined["TEAM_ID"].map(TEAM_ID_TO_NAME)
+    )
 
     output_path = (
         base_dir
