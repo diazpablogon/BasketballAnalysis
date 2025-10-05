@@ -247,6 +247,11 @@ BOX_SCORE_TEAMS_OUTPUT_ROOT = (
 )
 
 
+# --- Compatibilidad SeasonTypeAllStar (algunas versiones usan "preseason") ---
+if not hasattr(SeasonTypeAllStar, "pre_season") and hasattr(SeasonTypeAllStar, "preseason"):
+    SeasonTypeAllStar.pre_season = getattr(SeasonTypeAllStar, "preseason")
+
+
 def _normalize_season_type_value(season_type: str) -> str:
     """Normaliza etiquetas de ``season_type`` según los valores esperados por la API."""
 
