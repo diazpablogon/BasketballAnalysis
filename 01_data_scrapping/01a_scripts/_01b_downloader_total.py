@@ -29,6 +29,13 @@ TASKS = [
     },
 
     {
+        "name": "Box Scores Equipos (home/away)",
+        "rel_path": "_01a_get_boxscores_teams.py",
+        "enabled": False,
+        "extra_args": [],
+    },
+
+    {
         "name": "Team Dashboards",
         "rel_path": "_01a_get_team_dashboards.py",
         "enabled": True,
