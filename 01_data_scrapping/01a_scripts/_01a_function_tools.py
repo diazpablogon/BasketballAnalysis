@@ -358,6 +358,33 @@ def _normalize_boxscore_team_columns(df: pd.DataFrame, game_id: str) -> pd.DataF
     return normalized_df
 
 
+def _fallback_boxscore_team_table(resp) -> pd.DataFrame:
+    """Intenta localizar una tabla de equipos en la respuesta cuando falta TeamStats."""
+
+    if not resp:
+        return pd.DataFrame()
+
+    for name, table in _iter_endpoint_data_sets(resp):
+        if not isinstance(table, pd.DataFrame):
+            continue
+
+        if "TEAM_ID" in table.columns and len(table.columns) > 0:
+            return table
+
+    frames = []
+    if hasattr(resp, "get_data_frames"):
+        try:
+            frames = resp.get_data_frames() or []
+        except Exception:
+            frames = []
+
+    for table in frames:
+        if isinstance(table, pd.DataFrame) and "TEAM_ID" in table.columns:
+            return table
+
+    return pd.DataFrame()
+
+
 def _combine_summary_tables(resp, game_id: str) -> pd.DataFrame:
     """Combina LineScore y OtherStats (si aplica) para ``BoxScoreSummaryV2``."""
 
@@ -406,6 +433,11 @@ def _fetch_single_boxscore_team_df(
                         df = table
                         break
                 df = _normalize_boxscore_team_columns(df, game_id)
+
+                if df.empty:
+                    fallback_df = _fallback_boxscore_team_table(response)
+                    if not fallback_df.empty:
+                        df = _normalize_boxscore_team_columns(fallback_df, game_id)
 
             if df.empty:
                 logging.warning(
