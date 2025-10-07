@@ -112,7 +112,8 @@ def discover_game_files(base_dir: Path, season: str) -> Dict[str, Dict[str, Path
 
 
 def _transform_matchups(df: pd.DataFrame, game_id: str) -> pd.DataFrame:
-    """Reduce el boxscore de matchups a nivel jugador-ofensivo."""
+    """Ajusta el boxscore de matchups a nivel jugador-ofensivo si es necesario."""
+
     rename_map = {
         "OFF_TEAM_ID": "TEAM_ID",
         "OFF_TEAM_ABBREVIATION": "TEAM_ABBREVIATION",
@@ -123,29 +124,32 @@ def _transform_matchups(df: pd.DataFrame, game_id: str) -> pd.DataFrame:
     }
 
     missing = [col for col in rename_map if col not in df.columns]
-    if missing:
-        raise ValueError(
-            f"No se pueden renombrar columnas ofensivas para GAME_ID {game_id}: faltan {missing}"
-        )
+    if not missing:
+        df = df.rename(columns=rename_map)
+    else:
+        # Si ya está en formato jugador-equipo solo homogenizamos duplicados.
+        if not REQUIRED_JOIN_COLUMNS.issubset(df.columns):
+            raise ValueError(
+                "No se pueden armonizar columnas de matchups para "
+                f"GAME_ID {game_id}: faltan {missing}"
+            )
 
-    df = df.rename(columns=rename_map)
-    group_cols = ["GAME_ID", "TEAM_ID", "PLAYER_ID"]
-    if not all(col in df.columns for col in group_cols):
-        raise ValueError(
-            f"Columnas clave ausentes tras renombrar matchups para GAME_ID {game_id}"
-        )
+    group_cols = list(REQUIRED_JOIN_COLUMNS)
 
-    numeric_cols = df.select_dtypes(include="number").columns.difference(group_cols)
-    agg_spec: dict[str, str] = {col: "sum" for col in numeric_cols}
+    # Agregamos únicamente cuando hay filas duplicadas para las claves.
+    if df.duplicated(subset=group_cols).any():
+        numeric_cols = df.select_dtypes(include="number").columns.difference(group_cols)
+        agg_spec: dict[str, str] = {col: "sum" for col in numeric_cols}
 
-    non_numeric = [col for col in df.columns if col not in group_cols and col not in numeric_cols]
-    for col in non_numeric:
-        agg_spec[col] = "first"
+        non_numeric = [
+            col for col in df.columns if col not in group_cols and col not in numeric_cols
+        ]
+        for col in non_numeric:
+            agg_spec[col] = "first"
 
-    aggregated = (
-        df.groupby(group_cols, dropna=False).agg(agg_spec).reset_index()
-    )
-    return aggregated
+        df = df.groupby(group_cols, dropna=False).agg(agg_spec).reset_index()
+
+    return df
 
 
 SPECIAL_TRANSFORMS = {
