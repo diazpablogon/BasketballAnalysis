@@ -76,10 +76,15 @@ def normalize_types(df: pd.DataFrame) -> pd.DataFrame:
         if pd.api.types.is_numeric_dtype(series):
             df[column] = series.astype(float)
             continue
-        converted = pd.to_numeric(series, errors="ignore")
-        if pd.api.types.is_numeric_dtype(converted):
-            df[column] = converted.astype(float)
+        try:
+            converted = pd.to_numeric(series)
+            if pd.api.types.is_numeric_dtype(converted):
+                df[column] = converted.astype(float)
+        except Exception:
+            # Ignora columnas no convertibles
+            continue
     return df
+
 
 
 def drop_duplicate_columns(df: pd.DataFrame, existing_columns: Iterable[str]) -> pd.DataFrame:
