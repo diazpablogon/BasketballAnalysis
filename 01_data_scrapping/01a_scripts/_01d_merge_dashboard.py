@@ -21,8 +21,51 @@ FILE_PATTERN = re.compile(
     re.IGNORECASE,
 )
 
+TEAM_NAME_MAP: Dict[int, str] = {
+    1610612737: "Atlanta Hawks",
+    1610612738: "Boston Celtics",
+    1610612739: "Cleveland Cavaliers",
+    1610612740: "New Orleans Pelicans",
+    1610612741: "Chicago Bulls",
+    1610612742: "Dallas Mavericks",
+    1610612743: "Denver Nuggets",
+    1610612744: "Golden State Warriors",
+    1610612745: "Houston Rockets",
+    1610612746: "LA Clippers",
+    1610612747: "Los Angeles Lakers",
+    1610612748: "Miami Heat",
+    1610612749: "Milwaukee Bucks",
+    1610612750: "Minnesota Timberwolves",
+    1610612751: "Brooklyn Nets",
+    1610612752: "New York Knicks",
+    1610612753: "Orlando Magic",
+    1610612754: "Indiana Pacers",
+    1610612755: "Philadelphia 76ers",
+    1610612756: "Phoenix Suns",
+    1610612757: "Portland Trail Blazers",
+    1610612758: "Sacramento Kings",
+    1610612759: "San Antonio Spurs",
+    1610612760: "Oklahoma City Thunder",
+    1610612761: "Toronto Raptors",
+    1610612762: "Utah Jazz",
+    1610612763: "Memphis Grizzlies",
+    1610612764: "Washington Wizards",
+    1610612765: "Detroit Pistons",
+    1610612766: "Charlotte Hornets",
+}
+
+KEY_COLUMN_ORDER = [
+    "TEAM_ID",
+    "TEAM_NAME",
+    "PLAYER_ID",
+    "GROUP_SET",
+    "GROUP_VALUE",
+    "GROUP_NAME",
+]
+
 SORT_KEY_PRIORITY = [
     "TEAM_ID",
+    "TEAM_NAME",
     "PLAYER_ID",
     "GROUP_ID",
     "GROUP_SET",
@@ -38,12 +81,90 @@ SORT_KEY_PRIORITY = [
     "Season",
 ]
 
+PT_PASS_KEY_SETS: Sequence[Sequence[str]] = (
+    ("TEAM_ID", "PLAYER_ID", "GROUP_SET", "GROUP_VALUE"),
+    ("TEAM_ID", "PLAYER_ID", "GROUP_SET", "GROUP_NAME"),
+    ("TEAM_ID", "PLAYER_ID", "GROUP_SET"),
+    ("TEAM_ID", "PLAYER_ID", "GROUP_VALUE"),
+    ("TEAM_ID", "PLAYER_ID"),
+    ("TEAM_ID", "GROUP_SET", "GROUP_VALUE", "GROUP_NAME"),
+    ("TEAM_ID", "GROUP_VALUE", "GROUP_NAME"),
+    ("TEAM_ID",),
+)
+
+ON_OFF_KEY_SETS: Sequence[Sequence[str]] = (
+    ("TEAM_ID", "PLAYER_ID", "GROUP_SET", "GROUP_VALUE", "GROUP_NAME"),
+    ("TEAM_ID", "PLAYER_ID", "GROUP_SET", "GROUP_VALUE"),
+    ("TEAM_ID", "PLAYER_ID", "GROUP_NAME"),
+    ("TEAM_ID", "PLAYER_ID", "GROUP_SET"),
+    ("TEAM_ID", "PLAYER_ID"),
+    ("TEAM_ID", "GROUP_SET", "GROUP_VALUE", "GROUP_NAME"),
+    ("TEAM_ID", "GROUP_VALUE", "GROUP_NAME"),
+    ("TEAM_ID",),
+)
+
 
 @dataclass
 class DashboardFile:
     path: Path
     team_id: Optional[int]
     dataset: int
+
+
+@dataclass
+class FrameBundle:
+    data: pd.DataFrame
+    template: List[str]
+
+
+@dataclass
+class MergeOutcome:
+    frame: pd.DataFrame
+    rename_map: Dict[str, str]
+    new_columns: List[str]
+    deduplicated: List[str]
+    keys: Optional[List[str]]
+    fallback_used: bool
+
+
+class ColumnTracker:
+    def __init__(self) -> None:
+        self.template: List[str] = []
+        self.additional: List[str] = []
+
+    def set_template(self, columns: Sequence[str]) -> None:
+        if not self.template and columns:
+            self.template = list(columns)
+
+    def apply_renames(self, rename_map: Dict[str, str]) -> None:
+        if not rename_map:
+            return
+        self.template = [rename_map.get(col, col) for col in self.template]
+        self.additional = [rename_map.get(col, col) for col in self.additional]
+
+    def register_additional(self, columns: Sequence[str]) -> None:
+        for col in columns:
+            if col not in self.template and col not in self.additional:
+                self.additional.append(col)
+
+    def ordered_columns(self, df: pd.DataFrame) -> List[str]:
+        keys = [col for col in KEY_COLUMN_ORDER if col in df.columns]
+        template_cols = [
+            col for col in self.template if col in df.columns and col not in keys
+        ]
+        additional_cols = [
+            col
+            for col in self.additional
+            if col in df.columns and col not in keys and col not in template_cols
+        ]
+        remaining = [
+            col
+            for col in df.columns
+            if col not in keys and col not in template_cols and col not in additional_cols
+        ]
+        return keys + template_cols + additional_cols + remaining
+
+
 
 
 def parse_args() -> argparse.Namespace:
@@ -95,12 +216,13 @@ def read_dashboard_frame(
     dashboard_file: DashboardFile,
     season: str,
     season_type: str,
-) -> Optional[pd.DataFrame]:
+) -> Optional[FrameBundle]:
     try:
         df = pd.read_parquet(dashboard_file.path)
     except Exception as exc:  # pragma: no cover - robustez en runtime
         logging.warning("No se pudo leer %s: %s", dashboard_file.path, exc)
         return None
+    template = list(df.columns)
     df = df.copy()
     if "TEAM_ID" not in df.columns and dashboard_file.team_id is not None:
         df["TEAM_ID"] = dashboard_file.team_id
@@ -114,15 +236,7 @@ def read_dashboard_frame(
     for column in ("SeasonType", "Season_Type", "SEASON_TYPE"):
         if column in df.columns:
             df[column] = season_type
-    return df
-
-
-def order_columns(df: pd.DataFrame) -> pd.DataFrame:
-    keys = [col for col in SORT_KEY_PRIORITY if col in df.columns]
-    remaining = [col for col in df.columns if col not in keys]
-    ordered = keys + sorted(remaining)
-    return df[ordered]
-
+    return FrameBundle(data=df, template=template)
 
 def sort_dataframe(df: pd.DataFrame) -> pd.DataFrame:
     sort_keys = [col for col in SORT_KEY_PRIORITY if col in df.columns]
@@ -131,123 +245,185 @@ def sort_dataframe(df: pd.DataFrame) -> pd.DataFrame:
     return df.sort_values(sort_keys).reset_index(drop=True)
 
 
-def concat_vertical(frames: Sequence[pd.DataFrame]) -> pd.DataFrame:
-    if not frames:
+def normalize_identifier_columns(df: pd.DataFrame, context: str) -> pd.DataFrame:
+    df = df.copy()
+    if "TEAM_ID" in df.columns:
+        team_id_series = pd.to_numeric(df["TEAM_ID"], errors="coerce").astype("Int64")
+        if team_id_series.isna().any():
+            missing = sorted(team_id_series[team_id_series.isna()].index.tolist())
+            logging.warning("%s - TEAM_ID con valores nulos en filas %s", context, missing)
+        else:
+            team_id_series = team_id_series.astype("int64")
+        df["TEAM_ID"] = team_id_series
+    if "PLAYER_ID" in df.columns:
+        df["PLAYER_ID"] = pd.to_numeric(df["PLAYER_ID"], errors="coerce").astype("Int64")
+    for column in ("GROUP_SET", "GROUP_VALUE", "GROUP_NAME"):
+        if column in df.columns:
+            series = df[column]
+            if pd.api.types.is_string_dtype(series) or series.dtype == object:
+                df[column] = series.astype("string").str.strip()
+    return df
+
+
+def ensure_team_name(df: pd.DataFrame, context: str) -> pd.DataFrame:
+    if "TEAM_ID" not in df.columns:
+        logging.warning("%s - no se encontró TEAM_ID para mapear TEAM_NAME", context)
+        return df
+    team_ids = pd.to_numeric(df["TEAM_ID"], errors="coerce")
+    mapped = team_ids.map(TEAM_NAME_MAP)
+    missing_ids = sorted(set(team_ids[mapped.isna()].dropna().astype(int).tolist()))
+    if missing_ids:
+        logging.warning("%s - TEAM_ID sin mapeo de nombre: %s", context, missing_ids)
+    team_name_series = pd.Series(mapped, index=df.index, dtype="string")
+    df = df.copy()
+    df["TEAM_NAME"] = team_name_series
+    if "TEAM_ID" in df.columns:
+        position = list(df.columns).index("TEAM_ID") + 1
+        team_name = df.pop("TEAM_NAME")
+        df.insert(position, "TEAM_NAME", team_name)
+    return df
+
+
+def finalize_dataframe(
+    df: pd.DataFrame,
+    tracker: ColumnTracker,
+    context: str,
+) -> pd.DataFrame:
+    df = normalize_identifier_columns(df, context)
+    df = ensure_team_name(df, context)
+    ordered_cols = tracker.ordered_columns(df)
+    df = df.reindex(columns=ordered_cols)
+    df = sort_dataframe(df)
+    return df
+
+
+def concat_bundles(
+    bundles: Sequence[FrameBundle],
+    tracker: ColumnTracker,
+    context: str,
+) -> pd.DataFrame:
+    if not bundles:
         return pd.DataFrame()
+    for bundle in bundles:
+        tracker.set_template(bundle.template)
+    frames = [bundle.data for bundle in bundles]
     combined = pd.concat(frames, ignore_index=True, sort=False)
-    combined = order_columns(combined)
-    combined = sort_dataframe(combined)
-    return combined
+    return finalize_dataframe(combined, tracker, context)
 
 
-def remove_identical_columns(base: pd.DataFrame, candidate: pd.DataFrame) -> pd.DataFrame:
-    overlap = [col for col in candidate.columns if col in base.columns]
-    drop_cols: List[str] = []
-    for col in overlap:
-        if base[col].equals(candidate[col]):
-            drop_cols.append(col)
-    if drop_cols:
-        candidate = candidate.drop(columns=drop_cols)
-    return candidate
+def rename_frames(frames: Sequence[pd.DataFrame], rename_map: Dict[str, str]) -> None:
+    if not rename_map:
+        return
+    for frame in frames:
+        frame.rename(columns=rename_map, inplace=True)
 
 
-def rename_collisions(
-    base: pd.DataFrame,
-    candidate: pd.DataFrame,
+def determine_join_keys(
+    left: pd.DataFrame,
+    right: pd.DataFrame,
+    preferred_sets: Sequence[Sequence[str]],
+) -> Optional[List[str]]:
+    for candidate in preferred_sets:
+        if not candidate:
+            continue
+        if not all(col in left.columns and col in right.columns for col in candidate):
+            continue
+        if left.duplicated(candidate).any() or right.duplicated(candidate).any():
+            continue
+        left_keys = left[candidate].copy()
+        right_keys = right[candidate].copy()
+        if left_keys.isnull().any(axis=None) or right_keys.isnull().any(axis=None):
+            continue
+        left_unique = left_keys.drop_duplicates().sort_values(candidate).reset_index(drop=True)
+        right_unique = right_keys.drop_duplicates().sort_values(candidate).reset_index(drop=True)
+        if len(left_unique) != len(left) or len(right_unique) != len(right):
+            continue
+        if left_unique.equals(right_unique):
+            return list(candidate)
+    return None
+
+
+def prepare_for_horizontal_merge(
+    left: pd.DataFrame,
+    right: pd.DataFrame,
     keys: Sequence[str],
     left_suffix: str,
     right_suffix: str,
-) -> Tuple[pd.DataFrame, pd.DataFrame]:
-    collisions = [
-        col for col in candidate.columns if col in base.columns and col not in keys
-    ]
-    if not collisions:
-        return base, candidate
-    base = base.copy()
-    candidate = candidate.copy()
-    for col in collisions:
-        if base[col].equals(candidate[col]):
-            candidate = candidate.drop(columns=[col])
+) -> Tuple[pd.DataFrame, pd.DataFrame, Dict[str, str], List[str], List[str]]:
+    left = left.copy()
+    right = right.copy()
+    rename_map: Dict[str, str] = {}
+    deduplicated: List[str] = []
+    new_columns: List[str] = []
+    for column in list(right.columns):
+        if column in keys:
             continue
-        base.rename(columns={col: f"{col}{left_suffix}"}, inplace=True)
-        candidate.rename(columns={col: f"{col}{right_suffix}"}, inplace=True)
-    return base, candidate
+        if column in left.columns:
+            if left[column].equals(right[column]):
+                right.drop(columns=[column], inplace=True)
+                deduplicated.append(column)
+            else:
+                new_left = f"{column}{left_suffix}"
+                new_right = f"{column}{right_suffix}"
+                left.rename(columns={column: new_left}, inplace=True)
+                right.rename(columns={column: new_right}, inplace=True)
+                rename_map[column] = new_left
+                new_columns.append(new_right)
+        else:
+            new_columns.append(column)
+    return left, right, rename_map, deduplicated, new_columns
 
 
-def infer_join_keys(frames: Sequence[pd.DataFrame]) -> List[str]:
-    if not frames:
-        return []
-    common_columns = set(frames[0].columns)
-    for df in frames[1:]:
-        common_columns &= set(df.columns)
-    if not common_columns:
-        return []
-    candidate_keys = [
-        col
-        for col in common_columns
-        if not pd.api.types.is_float_dtype(frames[0][col])
-    ]
-    if "TEAM_ID" in frames[0].columns and "TEAM_ID" not in candidate_keys:
-        candidate_keys.append("TEAM_ID")
-    ordered = [
-        col for col in SORT_KEY_PRIORITY if col in candidate_keys
-    ]
-    for col in sorted(candidate_keys):
-        if col not in ordered:
-            ordered.append(col)
-    valid_keys = [col for col in ordered if all(col in df.columns for df in frames)]
-    return valid_keys
-
-
-def merge_horizontal(
-    frames: Sequence[pd.DataFrame],
-    suffixes: Sequence[str],
+def merge_bundles_horizontal(
+    left: FrameBundle,
+    right: FrameBundle,
+    left_suffix: str,
+    right_suffix: str,
+    preferred_keys: Sequence[Sequence[str]],
     description: str,
-) -> Optional[pd.DataFrame]:
-    if not frames:
-        return None
-    keys = infer_join_keys(frames)
-    if keys:
-        base = frames[0]
-        for idx, df in enumerate(frames[1:], start=1):
-            left_suffix = suffixes[0]
-            right_suffix = suffixes[idx]
-            merged_left, adjusted = rename_collisions(base, df, keys, left_suffix, right_suffix)
-            try:
-                base = merged_left.merge(
-                    adjusted,
-                    on=keys,
-                    how="outer",
-                    validate="one_to_one",
-                )
-            except Exception as exc:
-                logging.warning(
-                    "%s - merge fallido con llaves %s: %s. Se intentará concat", description, keys, exc
-                )
-                keys = []
-                break
-        if keys:
-            return base
-    lengths = {len(df) for df in frames}
-    if len(lengths) != 1:
+) -> Optional[MergeOutcome]:
+    keys = determine_join_keys(left.data, right.data, preferred_keys)
+    if keys is not None:
+        left_prepared, right_prepared, rename_map, deduplicated, new_columns = prepare_for_horizontal_merge(
+            left.data, right.data, keys, left_suffix, right_suffix
+        )
+        left_indexed = left_prepared.set_index(keys)
+        right_indexed = right_prepared.set_index(keys)
+        merged = left_indexed.join(right_indexed, how="inner")
+        merged.reset_index(inplace=True)
+        return MergeOutcome(
+            frame=merged,
+            rename_map=rename_map,
+            new_columns=new_columns,
+            deduplicated=deduplicated,
+            keys=list(keys),
+            fallback_used=False,
+        )
+    if len(left.data) != len(right.data):
         logging.warning(
-            "%s - no fue posible alinear por índice debido a longitudes distintas: %s",
+            "%s - longitudes distintas sin llaves fiables: %s",
             description,
-            lengths,
+            {len(left.data), len(right.data)},
         )
         return None
-    aligned = [df.reset_index(drop=True) for df in frames]
-    base = aligned[0]
-    for idx, df in enumerate(aligned[1:], start=1):
-        left_suffix = suffixes[0]
-        right_suffix = suffixes[idx]
-        df = remove_identical_columns(base, df)
-        base, df = rename_collisions(base, df, [], left_suffix, right_suffix)
-        overlap = [col for col in df.columns if col in base.columns]
-        if overlap:
-            df = df.drop(columns=overlap)
-        base = pd.concat([base, df], axis=1)
-    return base
+    left_prepared, right_prepared, rename_map, deduplicated, new_columns = prepare_for_horizontal_merge(
+        left.data, right.data, [], left_suffix, right_suffix
+    )
+    merged = pd.concat(
+        [left_prepared.reset_index(drop=True), right_prepared.reset_index(drop=True)],
+        axis=1,
+    )
+    logging.warning("%s - sin llaves fiables, se usó alineamiento por índice", description)
+    return MergeOutcome(
+        frame=merged,
+        rename_map=rename_map,
+        new_columns=new_columns,
+        deduplicated=deduplicated,
+        keys=None,
+        fallback_used=True,
+    )
+
+
 
 
 def process_team_dash_lineups(
@@ -255,14 +431,16 @@ def process_team_dash_lineups(
     season: str,
     season_type: str,
 ) -> pd.DataFrame:
-    frames: List[pd.DataFrame] = []
+    bundles: List[FrameBundle] = []
+    tracker = ColumnTracker()
     for dashboard_file in files:
         if dashboard_file.dataset != 1:
             continue
-        df = read_dashboard_frame(dashboard_file, season, season_type)
-        if df is not None:
-            frames.append(df)
-    return concat_vertical(frames)
+        bundle = read_dashboard_frame(dashboard_file, season, season_type)
+        if bundle is None:
+            continue
+        bundles.append(bundle)
+    return concat_bundles(bundles, tracker, "team_dash_lineups__dataset_1")
 
 
 def process_team_dash_pt_pass(
@@ -276,30 +454,74 @@ def process_team_dash_pt_pass(
             continue
         files_by_team.setdefault(dashboard_file.team_id, {})[dashboard_file.dataset] = dashboard_file
     merged_frames: List[pd.DataFrame] = []
+    tracker = ColumnTracker()
     for team_id, datasets in sorted(files_by_team.items()):
-        available_frames: List[pd.DataFrame] = []
-        suffixes: List[str] = []
+        dataset_bundles: Dict[int, FrameBundle] = {}
         for dataset in (0, 1):
             dashboard_file = datasets.get(dataset)
             if dashboard_file is None:
                 continue
-            df = read_dashboard_frame(dashboard_file, season, season_type)
-            if df is None:
+            bundle = read_dashboard_frame(dashboard_file, season, season_type)
+            if bundle is None:
                 continue
-            df = df.copy()
-            df["TEAM_ID"] = pd.Series([team_id] * len(df), dtype="Int64")
-            available_frames.append(df)
-            suffixes.append("__d0" if dataset == 0 else "__d1")
-        if not available_frames:
+            dataset_bundles[dataset] = bundle
+        if not dataset_bundles:
             logging.warning("team_dash_pt_pass - TEAM_ID %s sin datasets 0/1", team_id)
             continue
+        base_dataset = 0 if 0 in dataset_bundles else min(dataset_bundles.keys())
+        base_bundle = dataset_bundles[base_dataset]
+        current_df = base_bundle.data.copy()
+        current_template = list(base_bundle.template)
+        tracker.set_template(current_template)
         description = f"team_dash_pt_pass TEAM_ID {team_id}"
-        merged = merge_horizontal(available_frames, suffixes, description)
-        if merged is None:
-            logging.warning("%s - no se obtuvo dataframe combinado", description)
-            continue
-        merged_frames.append(merged)
-    return concat_vertical(merged_frames)
+        for dataset, suffix in ((0, "__d0"), (1, "__d1")):
+            if dataset == base_dataset or dataset not in dataset_bundles:
+                continue
+            outcome = merge_bundles_horizontal(
+                FrameBundle(data=current_df, template=current_template),
+                dataset_bundles[dataset],
+                "__d0" if base_dataset == 0 else "__d1",
+                suffix,
+                PT_PASS_KEY_SETS,
+                f"{description} dataset {dataset}",
+            )
+            if outcome is None:
+                logging.warning("%s dataset %d - no se pudo combinar", description, dataset)
+                continue
+            if outcome.rename_map:
+                tracker.apply_renames(outcome.rename_map)
+                rename_frames(merged_frames, outcome.rename_map)
+                current_template = [outcome.rename_map.get(col, col) for col in current_template]
+                logging.info(
+                    "%s dataset %d - columnas renombradas por colisión: %s",
+                    description,
+                    dataset,
+                    [f"{old}->{new}" for old, new in outcome.rename_map.items()],
+                )
+            if outcome.deduplicated:
+                logging.info(
+                    "%s dataset %d - columnas duplicadas eliminadas: %s",
+                    description,
+                    dataset,
+                    outcome.deduplicated,
+                )
+            if outcome.new_columns:
+                tracker.register_additional(outcome.new_columns)
+                logging.info(
+                    "%s dataset %d - columnas añadidas: %s",
+                    description,
+                    dataset,
+                    outcome.new_columns,
+                )
+            if outcome.keys:
+                logging.info("%s dataset %d - llaves de unión: %s", description, dataset, outcome.keys)
+            current_df = outcome.frame
+        current_df["TEAM_ID"] = pd.Series([team_id] * len(current_df), dtype="int64")
+        merged_frames.append(current_df)
+    if not merged_frames:
+        return pd.DataFrame()
+    combined = pd.concat(merged_frames, ignore_index=True, sort=False)
+    return finalize_dataframe(combined, tracker, "team_dash_pt_pass")
 
 
 def process_team_dash_pt_reb(
@@ -307,14 +529,20 @@ def process_team_dash_pt_reb(
     season: str,
     season_type: str,
 ) -> Dict[int, pd.DataFrame]:
-    frames_by_dataset: Dict[int, List[pd.DataFrame]] = {i: [] for i in range(1, 5)}
+    bundles_by_dataset: Dict[int, List[FrameBundle]] = {i: [] for i in range(1, 5)}
+    trackers: Dict[int, ColumnTracker] = {i: ColumnTracker() for i in range(1, 5)}
     for dashboard_file in files:
-        if dashboard_file.dataset not in frames_by_dataset:
+        if dashboard_file.dataset not in bundles_by_dataset:
             continue
-        df = read_dashboard_frame(dashboard_file, season, season_type)
-        if df is not None:
-            frames_by_dataset[dashboard_file.dataset].append(df)
-    return {dataset: concat_vertical(frames) for dataset, frames in frames_by_dataset.items()}
+        bundle = read_dashboard_frame(dashboard_file, season, season_type)
+        if bundle is not None:
+            bundles_by_dataset[dashboard_file.dataset].append(bundle)
+    output: Dict[int, pd.DataFrame] = {}
+    for dataset, bundles in bundles_by_dataset.items():
+        tracker = trackers[dataset]
+        df = concat_bundles(bundles, tracker, f"team_dash_pt_reb__dataset_{dataset}")
+        output[dataset] = df
+    return output
 
 
 def process_team_dash_pt_shots(
@@ -322,14 +550,20 @@ def process_team_dash_pt_shots(
     season: str,
     season_type: str,
 ) -> Dict[int, pd.DataFrame]:
-    frames_by_dataset: Dict[int, List[pd.DataFrame]] = {i: [] for i in range(6)}
+    bundles_by_dataset: Dict[int, List[FrameBundle]] = {i: [] for i in range(6)}
+    trackers: Dict[int, ColumnTracker] = {i: ColumnTracker() for i in range(6)}
     for dashboard_file in files:
-        if dashboard_file.dataset not in frames_by_dataset:
+        if dashboard_file.dataset not in bundles_by_dataset:
             continue
-        df = read_dashboard_frame(dashboard_file, season, season_type)
-        if df is not None:
-            frames_by_dataset[dashboard_file.dataset].append(df)
-    return {dataset: concat_vertical(frames) for dataset, frames in frames_by_dataset.items()}
+        bundle = read_dashboard_frame(dashboard_file, season, season_type)
+        if bundle is not None:
+            bundles_by_dataset[dashboard_file.dataset].append(bundle)
+    output: Dict[int, pd.DataFrame] = {}
+    for dataset, bundles in bundles_by_dataset.items():
+        tracker = trackers[dataset]
+        df = concat_bundles(bundles, tracker, f"team_dash_pt_shots__dataset_{dataset}")
+        output[dataset] = df
+    return output
 
 
 def process_simple_stack(
@@ -339,14 +573,20 @@ def process_simple_stack(
     season_type: str,
 ) -> Dict[int, pd.DataFrame]:
     allowed = set(allowed_datasets)
-    frames_by_dataset: Dict[int, List[pd.DataFrame]] = {dataset: [] for dataset in allowed}
+    bundles_by_dataset: Dict[int, List[FrameBundle]] = {dataset: [] for dataset in allowed}
+    trackers: Dict[int, ColumnTracker] = {dataset: ColumnTracker() for dataset in allowed}
     for dashboard_file in files:
         if dashboard_file.dataset not in allowed:
             continue
-        df = read_dashboard_frame(dashboard_file, season, season_type)
-        if df is not None:
-            frames_by_dataset[dashboard_file.dataset].append(df)
-    return {dataset: concat_vertical(frames) for dataset, frames in frames_by_dataset.items()}
+        bundle = read_dashboard_frame(dashboard_file, season, season_type)
+        if bundle is not None:
+            bundles_by_dataset[dashboard_file.dataset].append(bundle)
+    output: Dict[int, pd.DataFrame] = {}
+    for dataset, bundles in bundles_by_dataset.items():
+        tracker = trackers[dataset]
+        df = concat_bundles(bundles, tracker, f"simple_stack_dataset_{dataset}")
+        output[dataset] = df
+    return output
 
 
 def process_team_player_on_off(
@@ -355,45 +595,93 @@ def process_team_player_on_off(
     season: str,
     season_type: str,
 ) -> Dict[int, pd.DataFrame]:
-    details_by_team: Dict[Tuple[int, int], DashboardFile] = {}
-    summary_by_team: Dict[Tuple[int, int], DashboardFile] = {}
+    details_by_team: Dict[Tuple[int, int], FrameBundle] = {}
+    summary_by_team: Dict[Tuple[int, int], FrameBundle] = {}
     for dashboard_file in details_files:
         if dashboard_file.team_id is None:
             continue
-        details_by_team[(dashboard_file.team_id, dashboard_file.dataset)] = dashboard_file
+        bundle = read_dashboard_frame(dashboard_file, season, season_type)
+        if bundle is not None:
+            details_by_team[(dashboard_file.team_id, dashboard_file.dataset)] = bundle
     for dashboard_file in summary_files:
         if dashboard_file.team_id is None:
             continue
-        summary_by_team[(dashboard_file.team_id, dashboard_file.dataset)] = dashboard_file
+        bundle = read_dashboard_frame(dashboard_file, season, season_type)
+        if bundle is not None:
+            summary_by_team[(dashboard_file.team_id, dashboard_file.dataset)] = bundle
     datasets = {1, 2}
+    trackers: Dict[int, ColumnTracker] = {dataset: ColumnTracker() for dataset in datasets}
     frames_by_dataset: Dict[int, List[pd.DataFrame]] = {dataset: [] for dataset in datasets}
     keys = sorted(set(details_by_team) | set(summary_by_team))
     for (team_id, dataset) in keys:
         if dataset not in datasets:
             continue
-        details_file = details_by_team.get((team_id, dataset))
-        summary_file = summary_by_team.get((team_id, dataset))
-        frames: List[pd.DataFrame] = []
-        suffixes: List[str] = []
-        if details_file is not None:
-            df_det = read_dashboard_frame(details_file, season, season_type)
-            if df_det is not None:
-                frames.append(df_det)
-                suffixes.append("__det")
-        if summary_file is not None:
-            df_sum = read_dashboard_frame(summary_file, season, season_type)
-            if df_sum is not None:
-                frames.append(df_sum)
-                suffixes.append("__sum")
-        if not frames:
-            continue
+        tracker = trackers[dataset]
         description = f"team_player_on_off TEAM_ID {team_id} dataset {dataset}"
-        merged = merge_horizontal(frames, suffixes, description)
-        if merged is None:
-            logging.warning("%s - no se pudo combinar details+summary", description)
+        base_bundle = details_by_team.get((team_id, dataset))
+        other_bundle = summary_by_team.get((team_id, dataset))
+        base_suffix = "__det"
+        other_suffix = "__sum"
+        if base_bundle is None and other_bundle is None:
             continue
-        frames_by_dataset.setdefault(dataset, []).append(merged)
-    return {dataset: concat_vertical(frames) for dataset, frames in frames_by_dataset.items()}
+        if base_bundle is None:
+            base_bundle, other_bundle = other_bundle, None
+            base_suffix, other_suffix = "__sum", "__det"
+        current_df = base_bundle.data.copy()
+        current_template = list(base_bundle.template)
+        tracker.set_template(current_template)
+        if other_bundle is not None:
+            outcome = merge_bundles_horizontal(
+                FrameBundle(data=current_df, template=current_template),
+                other_bundle,
+                base_suffix,
+                other_suffix,
+                ON_OFF_KEY_SETS,
+                description,
+            )
+            if outcome is None:
+                logging.warning("%s - no se pudo combinar details+summary", description)
+            else:
+                if outcome.rename_map:
+                    tracker.apply_renames(outcome.rename_map)
+                    rename_frames(frames_by_dataset[dataset], outcome.rename_map)
+                    current_template = [outcome.rename_map.get(col, col) for col in current_template]
+                    logging.info(
+                        "%s - columnas renombradas por colisión: %s",
+                        description,
+                        [f"{old}->{new}" for old, new in outcome.rename_map.items()],
+                    )
+                if outcome.deduplicated:
+                    logging.info(
+                        "%s - columnas duplicadas eliminadas: %s",
+                        description,
+                        outcome.deduplicated,
+                    )
+                if outcome.new_columns:
+                    tracker.register_additional(outcome.new_columns)
+                    logging.info(
+                        "%s - columnas añadidas: %s",
+                        description,
+                        outcome.new_columns,
+                    )
+                if outcome.keys:
+                    logging.info("%s - llaves de unión: %s", description, outcome.keys)
+                current_df = outcome.frame
+        current_df["TEAM_ID"] = pd.Series([team_id] * len(current_df), dtype="int64")
+        frames_by_dataset[dataset].append(current_df)
+    output: Dict[int, pd.DataFrame] = {}
+    for dataset, frames in frames_by_dataset.items():
+        tracker = trackers[dataset]
+        if not frames:
+            output[dataset] = pd.DataFrame()
+            continue
+        combined = pd.concat(frames, ignore_index=True, sort=False)
+        output[dataset] = finalize_dataframe(
+            combined,
+            tracker,
+            f"team_player_on_off__dataset_{dataset}",
+        )
+    return output
 
 
 def ensure_output_dir(base_dir: Path, season: str) -> Path:
@@ -468,7 +756,7 @@ def process_dashboards(args: argparse.Namespace) -> Dict[str, Tuple[int, int]]:
         discovered.get("team_dash_pt_pass", []), args.season, args.season_type
     )
     if not pt_pass_df.empty:
-        output = output_dir / "team_dash_pt_pass__dataset_0_1__WIDE_byTEAM.parquet"
+        output = output_dir / "team_dash_pt_pass.parquet"
         summary[output.name] = write_dataframe(pt_pass_df, output, args.dry_run)
     else:
         logging.warning("team_dash_pt_pass - sin datos combinados")
@@ -552,9 +840,7 @@ def process_dashboards(args: argparse.Namespace) -> Dict[str, Tuple[int, int]]:
         if df.empty:
             logging.warning("team_player_on_off dataset %d sin datos combinados", dataset)
             continue
-        output = output_dir / (
-            f"team_player_on_off__dataset_{dataset}__DETAILS_PLUS_SUMMARY.parquet"
-        )
+        output = output_dir / f"team_player_on_off__dataset_{dataset}.parquet"
         summary[output.name] = write_dataframe(df, output, args.dry_run)
 
     return summary
