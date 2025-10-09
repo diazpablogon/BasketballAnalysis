@@ -788,16 +788,17 @@ def process_dashboards(args: argparse.Namespace) -> Dict[str, Tuple[int, int]]:
     # General splits dataset 0
     general_splits = process_simple_stack(
         discovered.get("team_dashboard_by_general_splits", []),
-        [0],
+        range(0, 6),
         args.season,
         args.season_type,
     )
-    df_general = general_splits.get(0, pd.DataFrame())
-    if not df_general.empty:
-        output = output_dir / "team_dashboard_by_general_splits__dataset_0.parquet"
+    for dataset in range(0, 6):
+        df_general = general_splits.get(dataset, pd.DataFrame())
+        if df_general.empty:
+            logging.warning("team_dashboard_by_general_splits dataset %d sin datos", dataset)
+            continue
+        output = output_dir / f"team_dashboard_by_general_splits__dataset_{dataset}.parquet"
         summary[output.name] = write_dataframe(df_general, output, args.dry_run)
-    else:
-        logging.warning("team_dashboard_by_general_splits dataset 0 sin datos")
 
     # Shooting splits datasets 1..6
     shooting_splits = process_simple_stack(
