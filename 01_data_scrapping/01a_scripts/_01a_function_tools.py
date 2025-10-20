@@ -13,6 +13,8 @@ from nba_api.stats.static import teams as static_teams
 # --- Logger ---
 logging.basicConfig(level=logging.INFO, format="%(asctime)s [%(levelname)s] %(message)s")
 
+logger = logging.getLogger(__name__)
+
 # --- Lista de endpoints a descargar (slug -> nombre de clase en nba_api) ---
 BOX_ENDPOINTS = [
     ("boxscore_traditional_v2", "BoxScoreTraditionalV2"),
@@ -111,28 +113,41 @@ def list_game_ids(season: str, include_playoffs: bool = False):
 def list_team_ids() -> list[int]:
     """Devuelve los IDs de los equipos NBA (solo franquicias activas)."""
 
-    get_active = getattr(static_teams, "get_active_teams", None)
-    if callable(get_active):
-        teams = get_active()
-        return [int(team["id"]) for team in teams]
-
-    teams = static_teams.get_teams()
     team_ids: list[int] = []
 
-    for team in teams:
-        flag = team.get("is_nba_team")
-        if flag is None:
-            flag = team.get("is_nba_franchise")
+    get_active = getattr(static_teams, "get_active_teams", None)
+    if callable(get_active):
+        try:
+            teams = get_active() or []
+        except Exception as exc:  # noqa: BLE001
+            logger.warning("No se pudieron obtener equipos activos: %s", exc)
+            teams = []
 
-        if isinstance(flag, str):
-            flag = flag.strip().lower() in {"true", "t", "1", "y", "yes"}
-        elif isinstance(flag, (int, float)):
-            flag = flag != 0
+        team_ids.extend(int(team["id"]) for team in teams if team.get("id"))
 
-        if flag:
-            team_ids.append(int(team["id"]))
+    if not team_ids:
+        try:
+            teams = static_teams.get_teams()
+        except Exception as exc:  # noqa: BLE001
+            logger.error("No se pudieron obtener equipos: %s", exc)
+            return []
 
-    return team_ids
+        for team in teams:
+            flag = team.get("is_nba_team")
+            if flag is None:
+                flag = team.get("is_nba_franchise")
+
+            if isinstance(flag, str):
+                flag = flag.strip().lower() in {"true", "t", "1", "y", "yes"}
+            elif isinstance(flag, (int, float)):
+                flag = flag != 0
+
+            if flag:
+                team_id = team.get("id")
+                if team_id is not None:
+                    team_ids.append(int(team_id))
+
+    return sorted(set(team_ids))
 
 def fetch_endpoint_df(endpoint_class_name: str, game_id: str, max_retries: int = 3, sleep: float = 0.8) -> pd.DataFrame:
     """Descarga un DataFrame de un endpoint concreto para un GAME_ID."""
