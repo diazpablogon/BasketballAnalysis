@@ -8,7 +8,12 @@ import pandas as pd
 from nba_api.stats.endpoints import TeamGameLog
 from nba_api.stats.library.parameters import SeasonTypeAllStar
 
-from _01a_function_tools import list_team_ids, _call_ep, save_parquet
+from _01a_function_tools import (
+    _call_ep,
+    list_team_ids,
+    list_team_ids_for_season,
+    save_parquet,
+)
 
 OUTPUT_ROOT = "/Users/pablo/Documents/BigData/BasketballAnalysis/00_data/00a_raw"
 ENDPOINT_SLUG = "teamgamelog"
@@ -180,7 +185,18 @@ def process_season(
     sleep: float = 0.8,
     max_retries: int = 3,
 ):
-    team_ids = sorted(list_team_ids())
+    team_ids = list_team_ids_for_season(
+        season,
+        include_playoffs=include_playoffs,
+    )
+    if not team_ids:
+        logger.warning(
+            "%s: no se obtuvieron equipos desde LeagueGameLog; se usará lista estática",
+            season,
+        )
+        team_ids = list_team_ids()
+
+    team_ids = sorted(team_ids)
     total_teams = len(team_ids)
     if total_teams == 0:
         logger.warning(f"{season}: no se encontraron equipos para descargar")

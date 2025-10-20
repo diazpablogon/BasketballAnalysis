@@ -110,6 +110,63 @@ def list_game_ids(season: str, include_playoffs: bool = False):
     return list(dict.fromkeys(game_ids))
 
 
+def list_team_ids_for_season(season: str, *, include_playoffs: bool = False) -> list[int]:
+    """Devuelve los ``TEAM_ID`` presentes en los game logs de la temporada."""
+
+    team_ids: list[int] = []
+
+    def _collect_ids(season_type: str) -> list[int]:
+        try:
+            response = _call_ep(
+                LeagueGameLog,
+                season=season,
+                season_type=season_type,
+            )
+        except Exception as exc:  # noqa: BLE001
+            logging.warning(
+                "%s: no se pudo obtener LeagueGameLog (%s): %s",
+                season,
+                season_type,
+                exc,
+            )
+            return []
+
+        frames = response.get_data_frames()
+        if not frames:
+            logging.warning(
+                "%s: LeagueGameLog (%s) no devolvió tablas",
+                season,
+                season_type,
+            )
+            return []
+
+        df = frames[0]
+        if "TEAM_ID" not in df.columns:
+            logging.warning(
+                "%s: LeagueGameLog (%s) sin columna TEAM_ID",
+                season,
+                season_type,
+            )
+            return []
+
+        team_series = pd.to_numeric(df["TEAM_ID"], errors="coerce").dropna().astype(int)
+        return team_series.tolist()
+
+    team_ids.extend(_collect_ids(SeasonTypeAllStar.regular))
+
+    if include_playoffs:
+        team_ids.extend(_collect_ids(SeasonTypeAllStar.playoffs))
+
+    ordered: list[int] = []
+    seen: set[int] = set()
+    for team_id in team_ids:
+        if team_id not in seen:
+            seen.add(team_id)
+            ordered.append(team_id)
+
+    return ordered
+
+
 def list_team_ids() -> list[int]:
     """Devuelve los IDs de los equipos NBA (solo franquicias activas)."""
 
