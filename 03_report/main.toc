@@ -1,0 +1,36 @@
+\babel@toc {spanish}{}\relax 
+\contentsline {chapter}{\'{I}ndice de figuras}{II}{chapter*.2}%
+\contentsline {chapter}{Acrónimos}{III}{chapter*.4}%
+\contentsline {chapter}{\numberline {1}Introducción}{1}{chapter.1}%
+\contentsline {chapter}{\numberline {2}Marco teórico}{4}{chapter.2}%
+\contentsline {section}{\numberline {2.1}Baloncesto: fundamentos y métricas}{4}{section.2.1}%
+\contentsline {section}{\numberline {2.2}Modelos y aprendizaje automático}{6}{section.2.2}%
+\contentsline {paragraph}{Random Forest (RF).}{6}{section*.21}%
+\contentsline {paragraph}{XGBoost (XGB).}{6}{section*.22}%
+\contentsline {chapter}{\numberline {3}Datos}{8}{chapter.3}%
+\contentsline {chapter}{\numberline {4}Metodología}{9}{chapter.4}%
+\contentsline {chapter}{\numberline {5}Modelos predictivos (Estimadores)}{10}{chapter.5}%
+\contentsline {section}{\numberline {5.1}Visión general}{10}{section.5.1}%
+\contentsline {section}{\numberline {5.2}Estimador 1: Victoria/Derrota por partido (W/L)}{10}{section.5.2}%
+\contentsline {subsection}{\numberline {5.2.1}Objetivo y unidad de análisis}{10}{subsection.5.2.1}%
+\contentsline {subsection}{\numberline {5.2.2}Diseño de \textit {features}: bloques y filosofía}{11}{subsection.5.2.2}%
+\contentsline {paragraph}{Bloque A — Fortaleza base y forma}{11}{section*.26}%
+\contentsline {paragraph}{Bloque B — Perfil de tiro y contestación}{11}{section*.27}%
+\contentsline {paragraph}{Bloque C — Rebote y segundas oportunidades}{11}{section*.28}%
+\contentsline {paragraph}{Bloque D — Creación y pérdidas}{11}{section*.29}%
+\contentsline {paragraph}{Bloque E — Tiros libres y disciplina}{11}{section*.30}%
+\contentsline {paragraph}{Bloque F — Contexto y calendario}{11}{section*.31}%
+\contentsline {paragraph}{Bloque G — Clutch con \textit {shrinkage}}{11}{section*.32}%
+\contentsline {paragraph}{Bloque H — Alineaciones esperadas y disponibilidad}{11}{section*.33}%
+\contentsline {paragraph}{Bloque I — Matchups estilísticos}{12}{section*.34}%
+\contentsline {subsection}{\numberline {5.2.3}Construcción del dataset y control de calidad}{12}{subsection.5.2.3}%
+\contentsline {subsection}{\numberline {5.2.4}Validación y selección de modelos}{12}{subsection.5.2.4}%
+\contentsline {paragraph}{RF (línea base robusta).}{12}{section*.35}%
+\contentsline {paragraph}{XGB (potencia y control).}{12}{section*.36}%
+\contentsline {paragraph}{Ensemble y calibración.}{12}{section*.37}%
+\contentsline {subsection}{\numberline {5.2.5}Producción y reportes operativos}{13}{subsection.5.2.5}%
+\contentsline {subsection}{\numberline {5.2.6}Checklist mínimo viable (MVP)}{13}{subsection.5.2.6}%
+\contentsline {section}{\numberline {5.3}Estimador 2: Diferencial de puntos por partido}{13}{section.5.3}%
+\contentsline {section}{\numberline {5.4}Estimador 3: Proyección de victorias de temporada}{14}{section.5.4}%
+\contentsline {section}{\numberline {5.5}Cierre}{14}{section.5.5}%
+\contentsline {chapter}{\numberline {6}Conclusiones y trabajo futuro}{15}{chapter.6}%

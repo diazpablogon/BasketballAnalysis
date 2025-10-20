@@ -1,0 +1,86 @@
+\chapter{Marco teórico}\label{chap:marco}
+
+Este capítulo establece los fundamentos conceptuales necesarios para el proyecto \textit{BasketballAnalysis}. 
+Primero se describen conceptos clave del baloncesto cuantitativo (posesiones, eficiencia, cuatro factores, 
+alineaciones y contexto competitivo). Después, se presenta el armazón de aprendizaje automático empleado, 
+incluyendo formulación del problema, validación temporal, modelos elegidos y consideraciones de calibración e interpretabilidad.
+
+\section{Baloncesto: fundamentos y métricas}\label{sec:baloncesto}
+
+\subsection*{Posesiones y ritmo}
+El análisis comparativo exige normalizar por volumen de posesiones. Una aproximación habitual al conteo de posesiones de un equipo es:
+\begin{equation}
+\mathrm{Poss} \approx \mathrm{FGA} + 0.44\,\mathrm{FTA} - \mathrm{OREB} + \mathrm{TOV}.
+\end{equation}
+El \textbf{ritmo} o \textbf{PACE} expresa posesiones por 48 minutos y permite comparar equipos que juegan a velocidades distintas.
+
+\subsection*{Eficiencia de tiro}
+La \textbf{eFG\%} ajusta el valor del triple:
+\begin{equation}
+\mathrm{eFG\%} = \frac{\mathrm{FGM} + 0.5 \cdot \mathrm{FG3M}}{\mathrm{FGA}}.
+\end{equation}
+La \textbf{TS\%} aproxima la eficiencia de anotación global incorporando tiros libres:
+\begin{equation}
+\mathrm{TS\%} = \frac{\mathrm{PTS}}{2\,(\mathrm{FGA} + 0.44\,\mathrm{FTA})}.
+\end{equation}
+
+\subsection*{Ratings por 100 posesiones}
+\begin{equation}
+\mathrm{ORtg} = 100 \cdot \frac{\mathrm{PTS}}{\mathrm{Poss}}, \qquad
+\mathrm{DRtg} = 100 \cdot \frac{\mathrm{PTS\ concedidos}}{\mathrm{Poss}}, \qquad
+\mathrm{NetRtg} = \mathrm{ORtg} - \mathrm{DRtg}.
+\end{equation}
+Estos indicadores permiten separar contribuciones ofensivas y defensivas normalizadas.
+
+\subsection*{Cuatro factores}
+Según la descomposición clásica, el rendimiento ofensivo se resume en cuatro pilares:
+(i) eficacia de tiro (eFG\%), (ii) pérdidas (TOV\%), (iii) rebote ofensivo (OREB\%) y (iv) tiros libres (FTr).
+Analizar su contribución relativa ayuda a explicar variaciones en \textit{NetRtg} entre equipos, alineaciones y contextos.
+
+\subsection*{Alineaciones, on/off y estabilidad}
+La composición de quintetos modula los espacios de tiro, la creación y la contención defensiva.
+Las métricas \textit{on/off} estiman el impacto de un jugador comparando el rendimiento del equipo cuando está en pista
+frente a cuando no lo está. No obstante, requieren \textit{shrinkage} o regularización por tamaño muestral para evitar conclusiones espurias.
+La \textbf{estabilidad de rotación} (varianza de quintetos utilizados) es una pista útil de consistencia táctica.
+
+\subsection*{Contexto competitivo}
+El lugar del partido (local/visitante), los días de descanso, los \textit{back-to-back} y el calendario reciente condicionan el rendimiento.
+Las segmentaciones temporales (meses, pre/post All-Star) capturan cambios de tendencia y ajustes de plantilla.
+
+\section{Modelos y aprendizaje automático}\label{sec:modelos}
+
+\subsection*{Formulación del problema}
+El proyecto incluye estimadores de distinta naturaleza. El \textbf{Estimador 1} se plantea como clasificación binaria (W/L por partido).
+Otros estimadores pueden formularse como regresión (diferencial de puntos) o agregación/proyección (victorias de temporada).
+
+\subsection*{Representación de datos y prevención de \textit{leakage}}
+Se construye una tabla de \textbf{partido–equipo}, donde cada fila representa un equipo en un partido dado.
+Todas las variables (\textit{features}) se calculan usando únicamente información disponible \emph{antes} del salto inicial.
+Se emplean diferencias simétricas frente al rival (\texttt{Feature\_Diff = Equipo - Rival}) para centrar el modelo en ventajas relativas.
+
+\subsection*{Validación temporal}
+La evaluación se realiza con \textbf{backtesting \textit{walk-forward}}: se entrena en el histórico hasta un punto temporal $T$ y se valida en el intervalo $(T, T+\Delta]$.
+Este esquema respeta la causalidad y evita fugas de información propias de particiones aleatorias.
+
+\subsection*{Modelos utilizados}
+\paragraph{Random Forest (RF).}
+Bosque de árboles con \textit{bagging}. Ventajas: robustez, poco \textit{tuning} y buena línea base.
+Parámetros prácticos: número de árboles alto, profundidad moderada, tamaño mínimo de hoja suficiente para evitar sobreajuste.
+
+\paragraph{XGBoost (XGB).}
+\textit{Gradient boosting} con regularización explícita.
+Capta no linealidades e interacciones de forma eficiente y suele optimizar métricas como LogLoss con buen sesgo-varianza.
+Parámetros clave: \texttt{learning\_rate}, \texttt{max\_depth}, \texttt{subsample}, \texttt{colsample\_bytree}, \texttt{min\_child\_weight}, y regularización L1/L2.
+
+\subsection*{Ponderación temporal y calibración}
+Las observaciones más recientes se ponderan más (decaimiento exponencial por días).
+La salida probabilística se \textbf{calibra} (Platt o isotónica) para que los porcentajes predichos coincidan con frecuencias observadas,
+lo cual es crucial en toma de decisiones.
+
+\subsection*{Interpretabilidad}
+Se emplean importancias por permutación y, en su caso, \textit{SHAP values} para explicar contribuciones globales y locales.
+La interpretabilidad permite auditar el comportamiento del modelo y detectar variables espurias o inestables.
+
+\subsection*{Despliegue y control de calidad}
+En producción, el flujo actualiza las \textit{features} hasta la víspera, infiere para los partidos del día y genera reportes de rendimiento,
+calibración y deriva (cambios de distribución) para mantenimiento preventivo.

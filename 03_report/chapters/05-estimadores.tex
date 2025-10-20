@@ -1,0 +1,122 @@
+\chapter{Modelos predictivos (Estimadores)}\label{chap:estimadores}
+
+Este capítulo describe la familia de estimadores que convivirán en el proyecto. 
+El \textbf{Estimador 1} aborda la probabilidad de victoria por partido (W/L).
+Se dejan además dos plantillas extensibles para estimadores adicionales, de modo que el proyecto crezca de forma coherente y modular.
+
+\section{Visión general}\label{sec:vision-general}
+Todos los estimadores comparten un \textbf{núcleo de datos} y criterios de calidad:
+(i) ingesta y normalización de fuentes (\textit{dashboards}, alineaciones, on/off, tiro/pase/rebote),
+(ii) ingeniería de variables por bloques, (iii) prevención de \textit{leakage}, 
+(iv) validación temporal \textit{walk-forward}, (v) calibración de salidas y (vi) reportes con explicabilidad.
+
+\section{Estimador 1: Victoria/Derrota por partido (W/L)}\label{sec:estimador1}
+
+\subsection{Objetivo y unidad de análisis}
+La unidad es \textbf{partido–equipo}. Para cada encuentro se generan dos registros (local y visitante).
+La variable objetivo es binaria: $y=1$ si el equipo gana y $y=0$ si pierde.
+El modelo produce una probabilidad \texttt{p\_win} previa al salto inicial y, opcionalmente, una proyección de victorias a futuro.
+
+\subsection{Diseño de \textit{features}: bloques y filosofía}
+Las \textit{features} se organizan en bloques, cada una calculada \emph{hasta la víspera} del partido y en variantes \textit{rolling} (3/5/10 últimos partidos) y \textit{season-to-date}. 
+Se prioriza la \textbf{simetría} mediante diferencias frente al rival (\texttt{Equipo - Rival}) para capturar ventajas relativas.
+
+\paragraph{Bloque A — Fortaleza base y forma}
+\textit{Off/Def/Net Rating} y \textit{PACE}, junto con los \textbf{Cuatro Factores} (eFG\%, TOV\%, OREB\%, FTr). 
+Se incluyen tendencias (diferencias recientes o pendientes) para reflejar forma.
+
+\paragraph{Bloque B — Perfil de tiro y contestación}
+Distribuciones por zona (aro, pintura, media, esquinas, \textit{above-the-break}), 
+tipología (pull-up vs. catch\&shoot) y contestación (distancia del defensor, tiempo de toque). 
+Se construyen señales de \textbf{calidad esperada} (xEFG) y se contrasta con lo que el rival concede.
+
+\paragraph{Bloque C — Rebote y segundas oportunidades}
+\textit{OREB\%}, \textit{DREB\%}, cadenas de segundas oportunidades y, si está disponible, métricas de \textit{hustle} (boxouts, balones sueltos).
+
+\paragraph{Bloque D — Creación y pérdidas}
+\textit{Assist\%}, asistencias potenciales y secundarias, pases por posesión, puntos creados por pase, 
+\textit{TOV\%} (idealmente separando pérdidas en vivo/muertas), transición (\% posesiones y puntos).
+
+\paragraph{Bloque E — Tiros libres y disciplina}
+\textit{Free Throw Rate} a favor/en contra, \textit{FT\%} y balance de faltas (recibidas/cometidas).
+
+\paragraph{Bloque F — Contexto y calendario}
+Local/visitante, diferencia de descanso, \textit{back-to-back}, tramos de 3 en 4 días y segmentaciones temporales (meses, pre/post All-Star).
+
+\paragraph{Bloque G — Clutch con \textit{shrinkage}}
+\textit{NetRtg}, eFG\% y pérdidas en minutos clutch, regularizados fuertemente para evitar ruido por muestras pequeñas.
+
+\paragraph{Bloque H — Alineaciones esperadas y disponibilidad}
+Quinteto probable y rotación corta. 
+\textit{Net/Off/Def Rating} de esas combinaciones (season-to-date y \textit{rolling}) ponderados por minutos.
+\textit{On/Off} de piezas clave con penalización por tamaño muestral.
+Estabilidad de rotación (varianza de quintetos utilizados recientemente).
+
+\paragraph{Bloque I — Matchups estilísticos}
+Compatibilidad entre lo que busca el ataque propio y lo que permite la defensa rival (rim attempts, corner 3, PnR handler, poste, etc. si están disponibles).
+
+\subsection{Construcción del dataset y control de calidad}
+\begin{enumerate}
+  \item Generar el calendario de partidos con identificadores (\texttt{GAME\_ID}, fecha, local/visitante, equipos).
+  \item Para cada fecha, calcular todos los bloques hasta la víspera y cruzar contra el rival para obtener diferencias.
+  \item Etiquetar el resultado W/L para cada registro partido–equipo.
+  \item Imputar valores ausentes con estadísticas robustas (medianas por equipo o globales) y winsorizar \textit{outliers}.
+  \item Asignar pesos temporales $w=\exp(-\Delta\text{días}/\text{halflife})$ (30–45 días como guía).
+\end{enumerate}
+
+\subsection{Validación y selección de modelos}
+El rendimiento se evalúa con \textbf{backtesting \textit{walk-forward}} (entrenar hasta $T$, validar en $(T, T+\Delta]$).
+Métricas principales: \textit{LogLoss}, \textit{Brier score} y AUC, además de análisis de calibración (curvas de fiabilidad, ECE).
+
+\paragraph{RF (línea base robusta).}
+Árboles numerosos, profundidad moderada, hojas con tamaño mínimo generoso. 
+Importancias por permutación en las ventanas de validación.
+
+\paragraph{XGB (potencia y control).}
+\textit{Learning rate} bajo, \textit{subsample} y \textit{colsample} en rangos conservadores, \textit{early stopping}.
+Regularización L1/L2 y \texttt{min\_child\_weight} para limitar complejidad efectiva.
+
+\paragraph{Ensemble y calibración.}
+Combinación ponderada de RF y XGB (según \textit{LogLoss} en validación) o \textit{stacking} con una logística final entrenada sobre predicciones \textit{out-of-fold}.
+Calibración posterior (Platt o isotónica) en el último tramo de validación.
+
+\subsection{Producción y reportes operativos}
+\begin{itemize}
+  \item Actualizar diariamente las \textit{features} hasta la víspera y obtener \texttt{p\_win} de los partidos del día.
+  \item Proyección de temporada: suma de probabilidades o simulación Monte Carlo sobre el calendario restante.
+  \item Paneles de control: estabilidad mensual, sesgos local/visitante, bins de probabilidad vs. frecuencia real (calibración).
+  \item Auditoría: importancias por permutación y \textit{SHAP} (si se usa XGB) a nivel global y por partido.
+\end{itemize}
+
+\subsection{Checklist mínimo viable (MVP)}
+\begin{itemize}
+  \item Núcleo: \texttt{NetRtg\_diff}, \texttt{eFG\%\_diff}, \texttt{TOV\%\_diff}, \texttt{OREB\%\_diff}, \texttt{FTr\_diff}.
+  \item Apoyo: \texttt{3PA rate diff}, \texttt{rim attempt diff}, \texttt{opp rim FG\% allowed diff}.
+  \item Contexto: \texttt{Rest\_diff}, \texttt{home}, flags de \textit{back-to-back}.
+  \item Plus: \texttt{Clutch\_NetRtg\_diff} regularizado y \texttt{Lineup\_expected\_NetRtg\_diff}.
+\end{itemize}
+
+\section{Estimador 2: Diferencial de puntos por partido}\label{sec:estimador2}
+\textbf{Objetivo (regresión).} Predecir el diferencial de puntos final (\texttt{pts\_for} - \texttt{pts\_against}) en la unidad partido–equipo. 
+Comparte bloques A–I del Estimador 1, pero el \textbf{target} es continuo. 
+Se evalúa con RMSE/MAE y se vigila la calibración \textit{quantile} (residuos simétricos).
+
+\textbf{Modelos.} RF regresión (línea base) y XGB regresión (ajustando \texttt{max\_depth}, \texttt{learning\_rate}, regularización).
+Atención al \textbf{sesgo local/visitante} y a la \textbf{heterocedasticidad}: 
+puede añadirse un modelo de varianza condicional o transformar el target (p.ej., winsorizar).
+
+\textbf{Uso.} Este estimador alimenta pronósticos derivados (márgenes, \textit{spreads}) y explica de forma continua el grado de superioridad/inferioridad esperado.
+
+\section{Estimador 3: Proyección de victorias de temporada}\label{sec:estimador3}
+\textbf{Objetivo (agregación/simulación).} Convertir probabilidades partido a partido en \textbf{victorias esperadas} o 
+en distribuciones de victorias mediante \textbf{Monte Carlo}. 
+
+\textbf{Flujo.} Usar las \texttt{p\_win} del Estimador 1 a lo largo del calendario restante; 
+(1) sumar probabilidades para una expectativa puntual, y/o (2) simular $N$ trayectorias de temporada para obtener percentiles (P10/P50/P90).
+
+\textbf{Control.} Recalibrar periódicamente \texttt{p\_win} con resultados recientes, 
+monitorizar deriva por cambios de plantilla y documentar supuestos (lesiones, descansos, traspasos).
+
+\section{Cierre}
+Este conjunto de estimadores cubre predicción binaria (W/L), magnitud del resultado (diferencial) y objetivos de planificación (victorias de temporada).
+La modularidad facilita añadir variantes (p.ej., \textit{in-game live}, métricas por alineación, o \textit{player impact}) sin reescribir el armazón.

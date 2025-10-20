@@ -1,0 +1,71 @@
+\documentclass[12pt,a4paper]{report}
+
+% ======= Configuración básica =======
+\usepackage[spanish, es-tabla]{babel}
+\usepackage[utf8]{inputenc}
+\usepackage[T1]{fontenc}
+\usepackage{lmodern}
+\usepackage{geometry}
+% Márgenes ajustados (tócalos si quieres aún más estrecho/ancho)
+\geometry{
+  a4paper,
+  left=25mm,
+  right=18mm,
+  top=20mm,
+  bottom=22mm,
+  includeheadfoot
+}
+\usepackage{setspace}
+\onehalfspacing
+\usepackage{graphicx}
+\graphicspath{{figs/}}
+\usepackage{booktabs}
+\usepackage{amsmath,amssymb}
+\usepackage{csquotes}
+\usepackage[hidelinks]{hyperref}
+\usepackage[nottoc]{tocbibind} % Añade LoF al TOC
+
+% ======= Metadatos =======
+\newcommand{\titulo}{BasketballAnalysis}
+\newcommand{\subtitulo}{Big Data de la NBA con IA y modelos predictivos de \textit{machine learning}}
+\newcommand{\autor}{Pablo Díaz}
+\newcommand{\fecha}{\today}
+
+% Opcional: pequeñas mejoras tipográficas
+\setlength{\parskip}{0.35em}
+\setlength{\parindent}{12pt}
+
+\begin{document}
+
+% ========= Portada =========
+\begin{titlepage}
+  \centering
+  {\huge \bfseries \titulo \par}
+  \vspace{0.6cm}
+  {\large \subtitulo \par}
+  \vfill
+  {\Large \autor \par}
+  \vspace{0.4cm}
+  {\large \fecha \par}
+\end{titlepage}
+
+% ========= Preliminares =========
+\pagenumbering{Roman}
+\tableofcontents
+\cleardoublepage
+\listoffigures
+\cleardoublepage
+
+% ========= Acrónimos (tu capítulo en itemize) =========
+\include{chapters/00-acronimos}
+
+% ========= Cuerpo =========
+\pagenumbering{arabic}
+\include{chapters/01-introduccion}
+\include{chapters/02-marco-teorico}
+\include{chapters/03-datos}
+\include{chapters/04-metodologia}
+\include{chapters/05-estimadores} % <--- NUEVO capítulo extenso
+\include{chapters/06-conclusiones}
+
+\end{document}

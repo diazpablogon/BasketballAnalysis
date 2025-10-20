@@ -1,0 +1,45 @@
+\chapter{Introducción}\label{chap:introduccion}
+
+\textbf{BasketballAnalysis} es un proyecto orientado a aplicar técnicas modernas de \gls{ia} y \gls{ml} sobre grandes volúmenes de datos de la \gls{nba}. 
+El objetivo es construir un flujo de trabajo reproducible que permita (i) entender qué factores explican el rendimiento de equipos, alineaciones y jugadores, 
+y (ii) entrenar modelos predictivos capaces de estimar resultados \gls{wl} y métricas asociadas al desempeño.
+
+\section*{Motivación}
+La \gls{nba} ofrece un ecosistema rico en datos: estadísticas tradicionales y avanzadas, \textit{play-by-play}, información de contextos (local/visitante, descansos, parciales), e incluso datos derivados (on/off, alineaciones, clústeres de tiro). 
+Aprovechar este \textit{Big Data} con \gls{ia}/\gls{ml} permite pasar de la descripción a la predicción, optimizando la toma de decisiones (rotaciones, emparejamientos, recursos) y generando conocimiento accionable.
+
+\section*{Problema a resolver}
+Dado un conjunto heterogéneo de fuentes (dashboards de equipo, alineaciones, tiro, pase, rebote, on/off, etc.), se requiere:
+\begin{enumerate}
+  \item Integrar, limpiar y estandarizar tablas para un modelo de datos coherente.
+  \item Definir y calcular métricas clave (\gls{efg}, \gls{ts}, \gls{ortg}, \gls{drtg}, \gls{netrtg}, \gls{pace}) y derivadas contextuales (descanso, rachas, calendario).
+  \item Identificar \textit{drivers} del rendimiento (correlaciones, importancia de variables, análisis de sensibilidad).
+  \item Entrenar y evaluar modelos predictivos para resultados \gls{wl} y otros objetivos (p.~ej. diferencial de puntos).
+\end{enumerate}
+
+\section*{Objetivos específicos}
+\begin{itemize}
+  \item Diseñar un pipeline reproducible de \gls{etl} y \gls{eda} sobre datos de la \gls{nba}.
+  \item Construir y validar modelos de clasificación (p.~ej. \gls{rf}, \gls{xgb}) para predicción \gls{wl}.
+  \item Evaluar modelos con métricas robustas (\gls{auc}, \gls{mae}, \gls{rmse}, calibración) y análisis de importancia/explicabilidad (\gls{shap}).
+  \item Documentar supuestos, limitaciones y recomendaciones de uso.
+\end{itemize}
+
+\section*{Alcance}
+El documento cubre la cadena completa, desde la descripción de datos y métricas, hasta la preparación de \textit{features}, 
+\textit{modeling} y evaluación. No se busca sustituir la \textit{scouting} cualitativa, sino complementarla con evidencia cuantitativa.
+
+\section*{Resumen metodológico}
+El flujo propuesto:
+\begin{enumerate}
+  \item \textbf{Ingesta \& limpieza}: carga de \texttt{parquet}, normalización de columnas y llaves (p.~ej. \texttt{GAME\_ID}, \texttt{TEAM\_ID}).
+  \item \textbf{Ingeniería de variables}: métricas avanzadas, contexto (local/visitante, descansos, post-\textit{All-Star}), \textit{rolling windows}, \textit{on/off}, alineaciones.
+  \item \textbf{EDA}: correlaciones (Spearman), mapas de calor, \textit{feature screening}.
+  \item \textbf{Modelado}: \gls{rf}/\gls{xgb} con validación temporal, cuidado del \textit{leakage}, balanceo si procede.
+  \item \textbf{Evaluación}: \gls{auc}, \gls{mae}/\gls{rmse} (si regresión), curva \gls{roc}, calibración y \gls{shap}.
+\end{enumerate}
+
+\section*{Organización del documento}
+El Capítulo~\ref{chap:marco} presenta el marco teórico; el Capítulo~\ref{chap:datos} describe los datos; 
+el Capítulo~\ref{chap:metodologia} detalla el pipeline de preparación y modelado; 
+el Capítulo~\ref{chap:resultados} muestra resultados y visualizaciones; y el Capítulo~\ref{chap:conclusiones} cierra con conclusiones y líneas futuras.
