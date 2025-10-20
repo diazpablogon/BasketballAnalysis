@@ -29,6 +29,13 @@ TASKS = [
     },
 
     {
+        "name": "Team Game Logs",
+        "rel_path": "_01a_get_teamgamelogs.py",
+        "enabled": True,
+        "extra_args": [],
+    },
+
+    {
         "name": "Team Dashboards",
         "rel_path": "_01a_get_team_dashboards.py",
         "enabled": True,
