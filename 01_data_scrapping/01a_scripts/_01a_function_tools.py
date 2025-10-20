@@ -111,8 +111,28 @@ def list_game_ids(season: str, include_playoffs: bool = False):
 def list_team_ids() -> list[int]:
     """Devuelve los IDs de los equipos NBA (solo franquicias activas)."""
 
+    get_active = getattr(static_teams, "get_active_teams", None)
+    if callable(get_active):
+        teams = get_active()
+        return [int(team["id"]) for team in teams]
+
     teams = static_teams.get_teams()
-    return [team["id"] for team in teams if team.get("is_nba_team")]
+    team_ids: list[int] = []
+
+    for team in teams:
+        flag = team.get("is_nba_team")
+        if flag is None:
+            flag = team.get("is_nba_franchise")
+
+        if isinstance(flag, str):
+            flag = flag.strip().lower() in {"true", "t", "1", "y", "yes"}
+        elif isinstance(flag, (int, float)):
+            flag = flag != 0
+
+        if flag:
+            team_ids.append(int(team["id"]))
+
+    return team_ids
 
 def fetch_endpoint_df(endpoint_class_name: str, game_id: str, max_retries: int = 3, sleep: float = 0.8) -> pd.DataFrame:
     """Descarga un DataFrame de un endpoint concreto para un GAME_ID."""
