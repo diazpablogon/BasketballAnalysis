@@ -312,6 +312,11 @@ def aggregate_boxscores(df: pd.DataFrame) -> pd.DataFrame:
     grouped = (
         cleaned_df.groupby(KEY_COLUMNS, as_index=False).agg(aggregation)
     )
+
+    # Redondear todas las columnas numéricas a 5 decimales
+    numeric_columns = grouped.select_dtypes(include=['number']).columns
+    grouped[numeric_columns] = grouped[numeric_columns].round(5)
+
     return grouped
 
 
