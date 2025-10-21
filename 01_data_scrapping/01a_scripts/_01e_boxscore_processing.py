@@ -21,6 +21,17 @@ DEFAULT_OUTPUT_PATH = Path(
 
 KEY_COLUMNS = ["GAME_ID", "TEAM_ID"]
 
+# Lista de todos los Team IDs de la NBA
+NBA_TEAM_IDS = [
+    "1610612737", "1610612738", "1610612739", "1610612740", "1610612741",
+    "1610612742", "1610612743", "1610612744", "1610612745", "1610612746",
+    "1610612747", "1610612748", "1610612749", "1610612750", "1610612751",
+    "1610612752", "1610612753", "1610612754", "1610612755", "1610612756",
+    "1610612757", "1610612758", "1610612759", "1610612760", "1610612761",
+    "1610612762", "1610612763", "1610612764", "1610612765", "1610612766",
+    "1610612767", "1610612768"
+]
+
 SUM_COLUMNS = [
     "AST",
     "BLK",
@@ -268,12 +279,57 @@ def ensure_string_keys(df: pd.DataFrame, key_columns: Sequence[str]) -> pd.DataF
     return df
 
 
+def filter_players_by_minutes(df: pd.DataFrame, min_minutes: float = 1.0) -> pd.DataFrame:
+    """
+    Filtra los jugadores que hayan jugado al menos min_minutes minutos.
+
+    Args:
+        df: DataFrame de boxscores de jugadores
+        min_minutes: Mínimo de minutos jugados para incluir al jugador
+
+    Returns:
+        DataFrame filtrado con solo jugadores que cumplen el criterio de minutos
+    """
+    if 'MIN' not in df.columns:
+        logging.warning("La columna MIN no está presente, no se puede filtrar por minutos jugados")
+        return df
+
+    # Convertir MIN a formato numérico si es string (formato MM:SS)
+    if df['MIN'].dtype == 'object':
+        def minutes_to_float(min_str):
+            if pd.isna(min_str):
+                return 0.0
+            try:
+                parts = str(min_str).split(':')
+                if len(parts) == 2:
+                    return int(parts[0]) + int(parts[1]) / 60.0
+                else:
+                    return float(min_str)
+            except (ValueError, TypeError):
+                return 0.0
+
+        df_minutes = df['MIN'].apply(minutes_to_float)
+    else:
+        df_minutes = df['MIN'].astype(float)
+
+    original_count = len(df)
+    filtered_df = df[df_minutes >= min_minutes].copy()
+    filtered_count = len(filtered_df)
+
+    logging.info(
+        "Filtrado por minutos: %d jugadores -> %d jugadores (>= %.1f minutos)",
+        original_count, filtered_count, min_minutes
+    )
+
+    return filtered_df
+
+
 def drop_ignored_columns(df: pd.DataFrame) -> pd.DataFrame:
     columns_to_drop = [
         column
         for column in df.columns
         if column not in KEY_COLUMNS
-        and (column in IGNORE_COLUMNS or column.lower() in IGNORE_COLUMNS_LOWER)
+           and (column in IGNORE_COLUMNS or column.lower() in IGNORE_COLUMNS_LOWER)
     ]
     if columns_to_drop:
         logging.debug("Columnas ignoradas del boxscore: %s", ", ".join(columns_to_drop))
@@ -321,7 +377,7 @@ def aggregate_boxscores(df: pd.DataFrame) -> pd.DataFrame:
 
 
 def drop_colliding_columns(
-    aggregated: pd.DataFrame, existing_columns: Sequence[str]
+        aggregated: pd.DataFrame, existing_columns: Sequence[str]
 ) -> Tuple[pd.DataFrame, List[str]]:
     collisions = [
         column
@@ -362,7 +418,7 @@ def order_new_columns(new_columns: Sequence[str]) -> List[str]:
 
 
 def merge_dataframes(
-    gamelog: pd.DataFrame, aggregated_boxscores: pd.DataFrame
+        gamelog: pd.DataFrame, aggregated_boxscores: pd.DataFrame
 ) -> Tuple[pd.DataFrame, List[str], List[str]]:
     original_columns = list(gamelog.columns)
     merged = gamelog.merge(aggregated_boxscores, on=KEY_COLUMNS, how="left")
@@ -401,41 +457,62 @@ def validate_final_dataframe(df: pd.DataFrame) -> Tuple[bool, bool]:
     return has_duplicates, two_rows_per_game
 
 
+def filter_nba_teams(df: pd.DataFrame) -> pd.DataFrame:
+    """
+    Filtra el DataFrame para mantener solo equipos de la NBA.
+    Usa la lista predefinida de NBA_TEAM_IDS.
+    """
+    original_count = len(df)
+
+    # Filtrar equipos de la NBA usando la lista predefinida
+    nba_teams = df[df['TEAM_ID'].isin(NBA_TEAM_IDS)]
+
+    filtered_count = len(nba_teams)
+    removed_count = original_count - filtered_count
+
+    if removed_count > 0:
+        logging.info(f"Filtrados {removed_count} registros no-NBA. Mantenidos {filtered_count} registros NBA.")
+
+    return nba_teams
+
+
 def main() -> None:
     args = parse_args()
-    logging.basicConfig(level=getattr(logging, args.log_level.upper(), logging.INFO), format="%(levelname)s: %(message)s")
+    logging.basicConfig(level=getattr(logging, args.log_level.upper(), logging.INFO),
+                        format="%(levelname)s: %(message)s")
 
     logging.info("Leyendo gamelog desde %s", args.gamelog)
     gamelog_df = ensure_string_keys(read_parquet(args.gamelog), KEY_COLUMNS)
+
+    # Filtrar gamelog para mantener solo equipos NBA
+    before_gamelog = len(gamelog_df)
+    gamelog_df = gamelog_df[gamelog_df["TEAM_ID"].isin(NBA_TEAM_IDS)].copy()
+    after_gamelog = len(gamelog_df)
     logging.info(
-        "Gamelog: %d filas, %d columnas",
+        "Gamelog: %d filas, %d columnas (filtrado de %d a %d filas)",
         len(gamelog_df),
         len(gamelog_df.columns),
+        before_gamelog,
+        after_gamelog
     )
 
     logging.info("Leyendo boxscores desde %s", args.boxscores)
     boxscores_df = ensure_string_keys(read_parquet(args.boxscores), KEY_COLUMNS)
-    # --- FILTRO DE EQUIPOS NBA ---
-    nba_team_ids = [
-        "1610612737", "1610612738", "1610612739", "1610612740", "1610612741",
-        "1610612742", "1610612743", "1610612744", "1610612745", "1610612746",
-        "1610612747", "1610612748", "1610612749", "1610612750", "1610612751",
-        "1610612752", "1610612753", "1610612754", "1610612755", "1610612756",
-        "1610612757", "1610612758", "1610612759", "1610612760", "1610612761",
-        "1610612762", "1610612763", "1610612764", "1610612765", "1610612766",
-        "1610612767", "1610612768"
-    ]
 
-    before_rows = len(boxscores_df)
-    boxscores_df = boxscores_df[boxscores_df["TEAM_ID"].isin(nba_team_ids)].copy()
-    after_rows = len(boxscores_df)
+    # Filtrar boxscores para mantener solo equipos NBA
+    before_boxscores = len(boxscores_df)
+    boxscores_df = boxscores_df[boxscores_df["TEAM_ID"].isin(NBA_TEAM_IDS)].copy()
+    after_boxscores = len(boxscores_df)
 
-    print(f"Filtrado equipos no NBA: {before_rows} -> {after_rows} filas")
-    # --- FIN FILTRO ---
+    # FILTRO NUEVO: Filtrar jugadores por minutos jugados (al menos 1 minuto)
+    boxscores_df = filter_players_by_minutes(boxscores_df, min_minutes=1.0)
+
     logging.info(
-        "Boxscores: %d filas, %d columnas",
+        "Boxscores: %d filas, %d columnas (filtrado de %d a %d filas + filtro por minutos)",
         len(boxscores_df),
         len(boxscores_df.columns),
+        before_boxscores,
+        after_boxscores
     )
 
     aggregated_boxscores = aggregate_boxscores(boxscores_df)
@@ -459,6 +536,15 @@ def main() -> None:
     merged_df, new_columns, ordered_new_columns = merge_dataframes(
         gamelog_df, aggregated_boxscores
     )
+
+    # Filtrar el resultado final por si acaso (aunque ya debería estar filtrado)
+    before_final = len(merged_df)
+    merged_df = merged_df[merged_df["TEAM_ID"].isin(NBA_TEAM_IDS)].copy()
+    after_final = len(merged_df)
+
+    if before_final != after_final:
+        logging.info(f"Filtrado final: {before_final} -> {after_final} filas")
+
     logging.info(
         "Total columnas nuevas agregadas: %d", len(new_columns)
     )
