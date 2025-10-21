@@ -29,9 +29,16 @@ TASKS = [
     },
 
     {
+        "name": "TeamGameLogs → per GAME (2 filas)",
+        "rel_path": "_01a_get_teamgamelogs_by_game.py",
+        "enabled": True,
+        "extra_args": [],
+    },
+
+    {
         "name": "Team Dashboards",
         "rel_path": "_01a_get_team_dashboards.py",
-        "enabled": True,
+        "enabled": False,
         "extra_args": [],
     },
 
