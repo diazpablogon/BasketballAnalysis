@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import argparse
 import logging
+import re
 from pathlib import Path
 from typing import Iterable, List, Optional, Sequence, Tuple
 
@@ -125,6 +126,14 @@ def ensure_required_columns(df: pd.DataFrame, columns: Sequence[str]) -> None:
     missing = [col for col in columns if col not in df.columns]
     if missing:
         raise ValueError(f"Columnas obligatorias ausentes: {', '.join(missing)}")
+
+
+def infer_season_from_path(path: Path) -> Optional[str]:
+    season_pattern = re.compile(r"\d{4}-\d{2}")
+    for part in path.parts:
+        if season_pattern.fullmatch(part):
+            return part
+    return None
 
 
 def most_frequent(series: pd.Series) -> Optional[object]:
@@ -477,14 +486,32 @@ def main() -> None:
         return
 
     df = pd.read_parquet(args.input_path)
-    if args.season:
-        if "SEASON" not in df.columns:
-            logging.error("La columna SEASON no está presente en los datos")
+
+    if "SEASON" not in df.columns:
+        season_value = args.season or infer_season_from_path(args.input_path)
+        if not season_value:
+            logging.error(
+                "La columna SEASON no está presente y no se pudo inferir. "
+                "Use --season o incluya la temporada en la ruta del archivo."
+            )
             return
+        df["SEASON"] = season_value
+        logging.info("Columna SEASON no encontrada; se asigna el valor %s", season_value)
+    elif args.season:
+        unique_seasons = df["SEASON"].dropna().unique()
+        if args.season not in unique_seasons:
+            logging.error("No hay registros para la temporada %s", args.season)
+            return
+
+    if args.season:
         df = df[df["SEASON"] == args.season]
         if df.empty:
             logging.error("No hay registros para la temporada %s", args.season)
             return
+    elif "SEASON" in df.columns and df["SEASON"].nunique(dropna=True) > 1:
+        logging.warning(
+            "Se detectaron múltiples temporadas en los datos y no se proporcionó filtro --season"
+        )
 
     summary = compute_summary(df, args.by_team_splits)
     summary, ranking_columns = add_rankings(summary, args.by_team_splits)
