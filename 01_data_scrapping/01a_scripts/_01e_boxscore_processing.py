@@ -532,19 +532,30 @@ def main() -> None:
             sort_columns.append("GAME_ID")
         sorted_gamelog = gamelog_df.sort_values(sort_columns).copy()
 
-        rolling_values = (
-            sorted_gamelog.groupby("TEAM_ID", group_keys=False)[rolling_source_columns]
-            .apply(lambda data: data.shift(1).rolling(window=10, min_periods=1).mean())
-            .reset_index(level=0, drop=True)
-        )
-        if isinstance(rolling_values, pd.Series):
-            rolling_values = rolling_values.to_frame()
-        rolling_values = rolling_values.add_prefix("ROLLING_")
+        numeric_sorted = sorted_gamelog.copy()
+        for column in rolling_source_columns:
+            numeric_sorted[column] = pd.to_numeric(
+                numeric_sorted[column], errors="coerce"
+            )
 
+        grouped = numeric_sorted.groupby("TEAM_ID", group_keys=False)
+
+        def _rolling_mean_prior(series: pd.Series) -> pd.Series:
+            return series.shift(1).rolling(window=10, min_periods=1).mean()
+
+        rolling_feature_data = {}
+        for column in rolling_source_columns:
+            rolling_feature_data[f"ROLLING_{column}"] = grouped[column].transform(
+                _rolling_mean_prior
+            )
+
+        rolling_feature_df = pd.DataFrame(
+            rolling_feature_data, index=sorted_gamelog.index
+        )
         rolling_features = pd.concat(
             [
                 sorted_gamelog[["TEAM_ID", "GAME_ID"]].reset_index(drop=True),
-                rolling_values.reset_index(drop=True),
+                rolling_feature_df.reset_index(drop=True),
             ],
             axis=1,
         )
