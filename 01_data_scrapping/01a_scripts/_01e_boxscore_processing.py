@@ -46,54 +46,74 @@ SUM_COLUMNS = [
     "OREB",
     "PF",
     "PFD",
+    "PTS",
     "REB",
     "STL",
-    "TO",
-    "PTS",
-    "PTS_2ND_CHANCE",
-    "PTS_FB",
-    "PTS_OFF_TOV",
-    "PTS_PAINT",
+    "TOV",
 ]
 
 MEAN_COLUMNS = [
     "AST_PCT",
-    "AST_RATIO",
     "AST_TOV",
+    "AST_TO",
+    "CFID",
+    "CFPARAMS",
     "DEF_RATING",
     "DREB_PCT",
     "EFG_PCT",
+    "E_OFF_RATING",
     "E_DEF_RATING",
     "E_NET_RATING",
-    "E_OFF_RATING",
     "E_PACE",
-    "E_USG_PCT",
+    "E_PACE",
     "FG3_PCT",
     "FG_PCT",
-    "FT_PCT",
-    "FTA_RATE",
     "NET_RATING",
     "OFF_RATING",
-    "OPP_EFG_PCT",
-    "OPP_FTA_RATE",
-    "OPP_OREB_PCT",
-    "OPP_PTS_2ND_CHANCE",
-    "OPP_PTS_FB",
-    "OPP_PTS_OFF_TOV",
-    "OPP_PTS_PAINT",
-    "OPP_TOV_PCT",
     "OREB_PCT",
     "PACE",
     "PACE_PER40",
-    "PCT_AST",
+    "PIE",
+    "POSS",
+    "REB_PCT",
+    "TM_TOV_PCT",
+    "TS_PCT",
+    "USG_PCT",
+    "SECOND_CHANCE_PTS",
+    "SECOND_CHANCE_PTS_2ND_CHANCE",
+    "PTS_2ND_CHANCE",
+    "PTS_FB",
+    "PTS_PAINT",
+    "PTS_OFF_TOV",
+    "OPP_PTS_2ND_CHANCE",
+    "OPP_PTS_FB",
+    "OPP_PTS_PAINT",
+    "OPP_PTS_OFF_TOV",
+    "OPP_TOV",
+    "OPP_AST",
+    "OPP_BLK",
+    "OPP_STL",
+    "OPP_OREB",
+    "OPP_DREB",
+    "OPP_REB",
+    "OPP_FGM",
+    "OPP_FGA",
+    "OPP_FG_PCT",
+    "OPP_FG3M",
+    "OPP_FG3A",
+    "OPP_FG3_PCT",
+    "OPP_FTM",
+    "OPP_FTA",
+    "OPP_FT_PCT",
+    "OPP_PF",
     "PCT_AST_2PM",
     "PCT_AST_3PM",
     "PCT_AST_FGM",
-    "PCT_BLK",
-    "PCT_BLKA",
+    "PCT_AST_UAST",
+    "PCT_BLK_2PA",
+    "PCT_BLK_3PA",
+    "PCT_BLK_FGA",
     "PCT_DREB",
-    "PCT_FG3A",
-    "PCT_FG3M",
     "PCT_FGA",
     "PCT_FGA_2PT",
     "PCT_FGA_3PT",
@@ -126,108 +146,22 @@ MEAN_COLUMNS = [
     "USG_PCT",
 ]
 
-IGNORE_COLUMNS = {
-    "PLAYER_ID",
-    "PLAYER_NAME",
-    "NICKNAME",
-    "TEAM_ABBREVIATION",
-    "TEAM_CITY",
-    "START_POSITION",
-    "COMMENT",
-    "endpoint",
-    "game_id",
-    "season",
-}
-IGNORE_COLUMNS_LOWER = {column.lower() for column in IGNORE_COLUMNS}
+INSERTION_ORDER_GROUPS: List[List[str]] = [
+    ["FGM", "FGA", "FG_PCT", "FG3M", "FG3A", "FG3_PCT", "FTM", "FTA", "FT_PCT"],
+    ["OREB", "DREB", "REB", "AST", "STL", "BLK", "TOV", "PF", "PFD", "PTS"],
+    ["PLUS_MINUS", "POSS", "PACE", "PACE_PER40", "E_PACE"],
+    ["OFF_RATING", "DEF_RATING", "NET_RATING", "E_OFF_RATING", "E_DEF_RATING", "E_NET_RATING", "TS_PCT", "EFG_PCT"],
+    ["USG_PCT", "REB_PCT", "OREB_PCT", "DREB_PCT", "TM_TOV_PCT", "PIE"],
+    ["SECOND_CHANCE_PTS", "PTS_OFF_TOV", "PTS_FB", "PTS_PAINT"],
+    ["OPP_AST", "OPP_STL", "OPP_BLK", "OPP_OREB", "OPP_DREB", "OPP_REB"],
+    ["OPP_FGM", "OPP_FGA", "OPP_FG_PCT", "OPP_FG3M", "OPP_FG3A", "OPP_FG3_PCT", "OPP_FTM", "OPP_FTA", "OPP_FT_PCT"],
+    ["OPP_PF", "OPP_TOV", "OPP_PTS_OFF_TOV", "OPP_PTS_FB", "OPP_PTS_PAINT", "OPP_PTS_2ND_CHANCE"],
+]
 
-INSERTION_ORDER_GROUPS: Tuple[Sequence[str], ...] = (
-    (
-        "OFF_RATING",
-        "DEF_RATING",
-        "NET_RATING",
-        "E_OFF_RATING",
-        "E_DEF_RATING",
-        "E_NET_RATING",
-    ),
-    (
-        "PACE",
-        "PACE_PER40",
-        "E_PACE",
-        "POSS",
-        "USG_PCT",
-        "E_USG_PCT",
-        "TM_TOV_PCT",
-    ),
-    (
-        "EFG_PCT",
-        "TS_PCT",
-        "FG_PCT",
-        "FG3_PCT",
-        "FT_PCT",
-        "FTA_RATE",
-    ),
-    (
-        "OREB_PCT",
-        "DREB_PCT",
-        "REB_PCT",
-    ),
-    (
-        "AST_PCT",
-        "AST_RATIO",
-        "AST_TOV",
-        "PCT_AST",
-        "PCT_AST_2PM",
-        "PCT_AST_3PM",
-        "PCT_AST_FGM",
-        "PCT_UAST_2PM",
-        "PCT_UAST_3PM",
-        "PCT_UAST_FGM",
-        "PCT_TOV",
-        "PCT_STL",
-        "PCT_BLK",
-        "PCT_BLKA",
-    ),
-    (
-        "PCT_FGA",
-        "PCT_FGA_2PT",
-        "PCT_FGA_3PT",
-        "PCT_FGM",
-        "PCT_FG3A",
-        "PCT_FG3M",
-        "PCT_FTA",
-        "PCT_FTM",
-        "PCT_PTS",
-        "PCT_PTS_2PT",
-        "PCT_PTS_2PT_MR",
-        "PCT_PTS_3PT",
-        "PCT_PTS_FB",
-        "PCT_PTS_FT",
-        "PCT_PTS_OFF_TOV",
-        "PCT_PTS_PAINT",
-    ),
-    (
-        "OPP_EFG_PCT",
-        "OPP_FTA_RATE",
-        "OPP_OREB_PCT",
-        "OPP_TOV_PCT",
-        "OPP_PTS_2ND_CHANCE",
-        "OPP_PTS_FB",
-        "OPP_PTS_OFF_TOV",
-        "OPP_PTS_PAINT",
-    ),
-    ("PIE",),
-)
-
-TOTALS_PRIORITY = (
-    "PTS_2ND_CHANCE",
-    "PTS_FB",
-    "PTS_OFF_TOV",
-    "PTS_PAINT",
-    "TO",
-    "BLKA",
-    "PFD",
-)
-
+TOTALS_PRIORITY: List[str] = [
+    "PTS", "REB", "AST", "STL", "BLK", "OREB", "DREB", "TOV",
+    "FGM", "FGA", "FG3M", "FG3A", "FTM", "FTA", "PF", "PFD",
+]
 
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(
@@ -254,48 +188,31 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument(
         "--dry-run",
         action="store_true",
-        help="Solo mostrar estadísticas sin escribir archivo",
+        help="No escribir archivo de salida, solo logs",
     )
     parser.add_argument(
         "--log-level",
+        type=str,
         default="INFO",
-        help="Nivel de logging (DEBUG, INFO, WARNING, ...)",
+        help="Nivel de log (DEBUG, INFO, WARNING, ERROR)",
     )
     return parser.parse_args()
 
-
 def read_parquet(path: Path) -> pd.DataFrame:
-    if not path.exists():
-        raise FileNotFoundError(f"No se encontró el archivo {path}")
-    return pd.read_parquet(path)
+    return pd.read_parquet(path, engine="pyarrow")
 
-
-def ensure_string_keys(df: pd.DataFrame, key_columns: Sequence[str]) -> pd.DataFrame:
-    df = df.copy()
-    for column in key_columns:
-        if column not in df.columns:
-            raise KeyError(f"La columna clave {column} no está presente en el DataFrame")
-        df[column] = df[column].astype("string")
+def ensure_string_keys(df: pd.DataFrame, keys: Sequence[str]) -> pd.DataFrame:
+    for key in keys:
+        if key in df.columns:
+            df[key] = df[key].astype(str)
     return df
 
-
 def filter_players_by_minutes(df: pd.DataFrame, min_minutes: float = 1.0) -> pd.DataFrame:
-    """
-    Filtra los jugadores que hayan jugado al menos min_minutes minutos.
-
-    Args:
-        df: DataFrame de boxscores de jugadores
-        min_minutes: Mínimo de minutos jugados para incluir al jugador
-
-    Returns:
-        DataFrame filtrado con solo jugadores que cumplen el criterio de minutos
-    """
     if 'MIN' not in df.columns:
-        logging.warning("La columna MIN no está presente, no se puede filtrar por minutos jugados")
-        return df
+        logging.warning("La columna 'MIN' no existe en el DataFrame. No se filtrará por minutos.")
+        return df.copy()
 
-    # Convertir MIN a formato numérico si es string (formato MM:SS)
-    if df['MIN'].dtype == 'object':
+    if df['MIN'].dtype == object:
         def minutes_to_float(min_str):
             if pd.isna(min_str):
                 return 0.0
@@ -323,58 +240,42 @@ def filter_players_by_minutes(df: pd.DataFrame, min_minutes: float = 1.0) -> pd.
 
     return filtered_df
 
-
 def drop_ignored_columns(df: pd.DataFrame) -> pd.DataFrame:
     columns_to_drop = [
-        column
-        for column in df.columns
-        if column not in KEY_COLUMNS
-           and (column in IGNORE_COLUMNS or column.lower() in IGNORE_COLUMNS_LOWER)
+        "VIDEO_AVAILABLE",
+        "COMMENT",
+        "NICKNAME",
+        "START_POSITION",
+        "START_TIME",
+        "PLUS_MINUS_RANK",
+        "GP_RANK",
+        "TEAM_ABBREVIATION",
+        "TEAM_NAME",
+        "PLAYER_ID",
+        "PLAYER_NAME",
+        "MIN_RANK",
     ]
+    columns_to_drop = [c for c in columns_to_drop if c in df.columns]
     if columns_to_drop:
-        logging.debug("Columnas ignoradas del boxscore: %s", ", ".join(columns_to_drop))
+        logging.debug("Eliminando columnas no relevantes de boxscores: %s", ", ".join(columns_to_drop))
         df = df.drop(columns=columns_to_drop)
     return df
 
-
-def build_aggregation_dict(df: pd.DataFrame) -> Tuple[Dict[str, str], List[str]]:
-    aggregation: Dict[str, str] = {}
-    missing_columns: List[str] = []
-    for column in SUM_COLUMNS:
-        if column in df.columns:
-            aggregation[column] = "sum"
-        else:
-            missing_columns.append(column)
-    for column in MEAN_COLUMNS:
-        if column in df.columns:
-            aggregation[column] = "mean"
-        else:
-            missing_columns.append(column)
-    if missing_columns:
-        logging.debug(
-            "Columnas del boxscore ausentes y no agregadas: %s",
-            ", ".join(sorted(set(missing_columns))),
-        )
-    return aggregation, missing_columns
-
-
 def aggregate_boxscores(df: pd.DataFrame) -> pd.DataFrame:
-    cleaned_df = drop_ignored_columns(df)
-    aggregation, _ = build_aggregation_dict(cleaned_df)
-    if not aggregation:
-        logging.warning("No hay columnas numéricas seleccionadas para agregar")
-        grouped = cleaned_df[KEY_COLUMNS].drop_duplicates()
-        return grouped
-    grouped = (
-        cleaned_df.groupby(KEY_COLUMNS, as_index=False).agg(aggregation)
-    )
+    df = drop_ignored_columns(df)
 
-    # Redondear todas las columnas numéricas a 5 decimales
-    numeric_columns = grouped.select_dtypes(include=['number']).columns
+    sumable = [c for c in SUM_COLUMNS if c in df.columns]
+    meanable = [c for c in MEAN_COLUMNS if c in df.columns]
+
+    agg_dict: Dict[str, str] = {c: "sum" for c in sumable}
+    agg_dict.update({c: "mean" for c in meanable})
+
+    grouped = df.groupby(KEY_COLUMNS, as_index=False).agg(agg_dict)
+
+    numeric_columns = [c for c in grouped.columns if c not in KEY_COLUMNS]
     grouped[numeric_columns] = grouped[numeric_columns].round(5)
 
     return grouped
-
 
 def drop_colliding_columns(
         aggregated: pd.DataFrame, existing_columns: Sequence[str]
@@ -389,7 +290,6 @@ def drop_colliding_columns(
         aggregated = aggregated.drop(columns=collisions)
     return aggregated, collisions
 
-
 def order_new_columns(new_columns: Sequence[str]) -> List[str]:
     ordered: List[str] = []
     new_set = set(new_columns)
@@ -401,13 +301,7 @@ def order_new_columns(new_columns: Sequence[str]) -> List[str]:
         if column in new_set and column not in ordered
     ]
     ordered.extend(totals_to_add)
-    remaining_totals = [
-        column
-        for column in SUM_COLUMNS
-        if column in new_set and column not in ordered
-    ]
-    ordered.extend(remaining_totals)
-    remaining = [column for column in new_columns if column not in ordered]
+    remaining = [c for c in new_columns if c not in ordered]
     if remaining:
         logging.debug(
             "Columnas nuevas sin orden específico, se agregan al final: %s",
@@ -415,7 +309,6 @@ def order_new_columns(new_columns: Sequence[str]) -> List[str]:
         )
         ordered.extend(sorted(remaining))
     return ordered
-
 
 def merge_dataframes(
         gamelog: pd.DataFrame, aggregated_boxscores: pd.DataFrame
@@ -434,7 +327,6 @@ def merge_dataframes(
     final_columns = before + ordered_new_columns + after
     merged = merged[final_columns]
     return merged, new_columns, ordered_new_columns
-
 
 def validate_final_dataframe(df: pd.DataFrame) -> Tuple[bool, bool]:
     duplicated_pairs = df.duplicated(subset=KEY_COLUMNS, keep=False)
@@ -456,25 +348,13 @@ def validate_final_dataframe(df: pd.DataFrame) -> Tuple[bool, bool]:
         logging.info("Validación GAME_ID: 2 filas por partido confirmadas")
     return has_duplicates, two_rows_per_game
 
-
 def filter_nba_teams(df: pd.DataFrame) -> pd.DataFrame:
     """
     Filtra el DataFrame para mantener solo equipos de la NBA.
-    Usa la lista predefinida de NBA_TEAM_IDS.
     """
-    original_count = len(df)
-
-    # Filtrar equipos de la NBA usando la lista predefinida
-    nba_teams = df[df['TEAM_ID'].isin(NBA_TEAM_IDS)]
-
-    filtered_count = len(nba_teams)
-    removed_count = original_count - filtered_count
-
-    if removed_count > 0:
-        logging.info(f"Filtrados {removed_count} registros no-NBA. Mantenidos {filtered_count} registros NBA.")
-
-    return nba_teams
-
+    if "TEAM_ID" not in df.columns:
+        return df
+    return df[df["TEAM_ID"].isin(NBA_TEAM_IDS)].copy()
 
 def main() -> None:
     args = parse_args()
@@ -495,76 +375,6 @@ def main() -> None:
         before_gamelog,
         after_gamelog
     )
-
-    combined_columns = list(dict.fromkeys(SUM_COLUMNS + MEAN_COLUMNS))
-    rolling_source_columns = [
-        column for column in combined_columns if column in gamelog_df.columns
-    ]
-    missing_rolling_columns = [
-        column for column in combined_columns if column not in gamelog_df.columns
-    ]
-    if missing_rolling_columns:
-        logging.debug(
-            "Columnas no disponibles para rolling averages: %s",
-            ", ".join(sorted(missing_rolling_columns)),
-        )
-
-    if not rolling_source_columns:
-        logging.warning(
-            "No se calcularon promedios móviles: ninguna columna esperada está presente"
-        )
-    elif "GAME_DATE" not in gamelog_df.columns:
-        logging.warning(
-            "No se calcularon promedios móviles: la columna GAME_DATE no está presente"
-        )
-    elif "GAME_ID" not in gamelog_df.columns:
-        logging.warning(
-            "No se calcularon promedios móviles: la columna GAME_ID no está presente"
-        )
-    else:
-        if not pd.api.types.is_datetime64_any_dtype(gamelog_df["GAME_DATE"]):
-            gamelog_df["GAME_DATE"] = pd.to_datetime(
-                gamelog_df["GAME_DATE"], errors="coerce"
-            )
-        if gamelog_df["GAME_DATE"].isna().any():
-            logging.warning(
-                "Algunos valores de GAME_DATE son inválidos; sus rolling averages serán NaN"
-            )
-
-        sort_columns = ["TEAM_ID", "GAME_DATE", "GAME_ID"]
-        sorted_gamelog = gamelog_df.sort_values(sort_columns).copy()
-
-        numeric_values = sorted_gamelog[rolling_source_columns].apply(
-            pd.to_numeric, errors="coerce"
-        )
-        grouped_numeric = numeric_values.groupby(sorted_gamelog["TEAM_ID"])
-
-        rolling_means = grouped_numeric.transform(
-            lambda series: series.shift(1)
-            .rolling(window=10, min_periods=1)
-            .mean()
-        )
-        rolling_means = rolling_means.rename(
-            columns={column: f"ROLLING_{column}" for column in rolling_means.columns}
-        )
-
-        rolling_features = pd.concat(
-            [sorted_gamelog[["TEAM_ID", "GAME_ID"]], rolling_means], axis=1
-        )
-        rolling_features = rolling_features.drop_duplicates(
-            subset=["TEAM_ID", "GAME_ID"], keep="last"
-        )
-
-        gamelog_df = gamelog_df.merge(
-            rolling_features,
-            on=["TEAM_ID", "GAME_ID"],
-            how="left",
-        )
-
-        logging.info(
-            "Rolling averages agregadas: %d columnas (ventana=10, shift=1)",
-            len(rolling_means.columns),
-        )
 
     logging.info("Leyendo boxscores desde %s", args.boxscores)
     boxscores_df = ensure_string_keys(read_parquet(args.boxscores), KEY_COLUMNS)
@@ -606,6 +416,64 @@ def main() -> None:
     merged_df, new_columns, ordered_new_columns = merge_dataframes(
         gamelog_df, aggregated_boxscores
     )
+
+    # === (MOVIDO AQUÍ) Rolling averages sobre el DataFrame ENRIQUECIDO ===
+    combined_columns = list(dict.fromkeys(SUM_COLUMNS + MEAN_COLUMNS))
+    rolling_source_columns = [
+        column for column in combined_columns if column in merged_df.columns
+    ]
+    missing_rolling_columns = [
+        column for column in combined_columns if column not in merged_df.columns
+    ]
+    if missing_rolling_columns:
+        logging.debug(
+            "Columnas no disponibles para rolling averages: %s",
+            ", ".join(sorted(missing_rolling_columns)),
+        )
+
+    if not rolling_source_columns:
+        logging.warning(
+            "No se calcularon promedios móviles: ninguna columna esperada está presente"
+        )
+    elif "GAME_DATE" not in merged_df.columns:
+        logging.warning(
+            "No se calcularon promedios móviles: la columna GAME_DATE no está presente"
+        )
+    elif "GAME_ID" not in merged_df.columns:
+        logging.warning(
+            "No se calcularon promedios móviles: la columna GAME_ID no está presente"
+        )
+    else:
+        if not pd.api.types.is_datetime64_any_dtype(merged_df["GAME_DATE"]):
+            merged_df["GAME_DATE"] = pd.to_datetime(
+                merged_df["GAME_DATE"], errors="coerce"
+            )
+        if merged_df["GAME_DATE"].isna().any():
+            logging.warning(
+                "Algunos valores de GAME_DATE son inválidos; sus rolling averages serán NaN"
+            )
+        merged_sorted = merged_df.sort_values(["TEAM_ID", "GAME_DATE", "GAME_ID"])
+        rolling_means = (
+            merged_sorted
+            .groupby("TEAM_ID", as_index=False, sort=False)[rolling_source_columns]
+            .apply(lambda g: g.shift(1).rolling(window=10, min_periods=1).mean())
+            .reset_index(level=0, drop=True)
+        )
+        rolling_means = rolling_means.add_prefix("ROLL10_")
+        rolling_features = pd.concat(
+            [merged_sorted[["TEAM_ID", "GAME_ID"]], rolling_means], axis=1
+        )
+        merged_df = merged_df.merge(
+            rolling_features,
+            on=["TEAM_ID", "GAME_ID"],
+            how="left",
+        )
+
+        logging.info(
+            "Rolling averages agregadas: %d columnas (ventana=10, shift=1)",
+            len(rolling_means.columns),
+        )
+    # === FIN BLOQUE MOVIDO ===
 
     # Filtrar el resultado final por si acaso (aunque ya debería estar filtrado)
     before_final = len(merged_df)
