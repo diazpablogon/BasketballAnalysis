@@ -517,6 +517,10 @@ def main() -> None:
         logging.warning(
             "No se calcularon promedios móviles: la columna GAME_DATE no está presente"
         )
+    elif "GAME_ID" not in gamelog_df.columns:
+        logging.warning(
+            "No se calcularon promedios móviles: la columna GAME_ID no está presente"
+        )
     else:
         if not pd.api.types.is_datetime64_any_dtype(gamelog_df["GAME_DATE"]):
             gamelog_df["GAME_DATE"] = pd.to_datetime(
@@ -527,37 +531,25 @@ def main() -> None:
                 "Algunos valores de GAME_DATE son inválidos; sus rolling averages serán NaN"
             )
 
-        sort_columns = ["TEAM_ID", "GAME_DATE"]
-        if "GAME_ID" in gamelog_df.columns:
-            sort_columns.append("GAME_ID")
+        sort_columns = ["TEAM_ID", "GAME_DATE", "GAME_ID"]
         sorted_gamelog = gamelog_df.sort_values(sort_columns).copy()
 
-        numeric_sorted = sorted_gamelog.copy()
-        for column in rolling_source_columns:
-            numeric_sorted[column] = pd.to_numeric(
-                numeric_sorted[column], errors="coerce"
-            )
-
-        grouped = numeric_sorted.groupby("TEAM_ID", group_keys=False)
-
-        def _rolling_mean_prior(series: pd.Series) -> pd.Series:
-            return series.shift(1).rolling(window=10, min_periods=1).mean()
-
-        rolling_feature_data = {}
-        for column in rolling_source_columns:
-            rolling_feature_data[f"ROLLING_{column}"] = grouped[column].transform(
-                _rolling_mean_prior
-            )
-
-        rolling_feature_df = pd.DataFrame(
-            rolling_feature_data, index=sorted_gamelog.index
+        numeric_values = sorted_gamelog[rolling_source_columns].apply(
+            pd.to_numeric, errors="coerce"
         )
+        grouped_numeric = numeric_values.groupby(sorted_gamelog["TEAM_ID"])
+
+        rolling_means = grouped_numeric.transform(
+            lambda series: series.shift(1)
+            .rolling(window=10, min_periods=1)
+            .mean()
+        )
+        rolling_means = rolling_means.rename(
+            columns={column: f"ROLLING_{column}" for column in rolling_means.columns}
+        )
+
         rolling_features = pd.concat(
-            [
-                sorted_gamelog[["TEAM_ID", "GAME_ID"]].reset_index(drop=True),
-                rolling_feature_df.reset_index(drop=True),
-            ],
-            axis=1,
+            [sorted_gamelog[["TEAM_ID", "GAME_ID"]], rolling_means], axis=1
         )
         rolling_features = rolling_features.drop_duplicates(
             subset=["TEAM_ID", "GAME_ID"], keep="last"
@@ -571,7 +563,7 @@ def main() -> None:
 
         logging.info(
             "Rolling averages agregadas: %d columnas (ventana=10, shift=1)",
-            len(rolling_source_columns),
+            len(rolling_means.columns),
         )
 
     logging.info("Leyendo boxscores desde %s", args.boxscores)
