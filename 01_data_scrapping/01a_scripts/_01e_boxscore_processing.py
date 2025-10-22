@@ -496,6 +496,73 @@ def main() -> None:
         after_gamelog
     )
 
+    combined_columns = list(dict.fromkeys(SUM_COLUMNS + MEAN_COLUMNS))
+    rolling_source_columns = [
+        column for column in combined_columns if column in gamelog_df.columns
+    ]
+    missing_rolling_columns = [
+        column for column in combined_columns if column not in gamelog_df.columns
+    ]
+    if missing_rolling_columns:
+        logging.debug(
+            "Columnas no disponibles para rolling averages: %s",
+            ", ".join(sorted(missing_rolling_columns)),
+        )
+
+    if not rolling_source_columns:
+        logging.warning(
+            "No se calcularon promedios móviles: ninguna columna esperada está presente"
+        )
+    elif "GAME_DATE" not in gamelog_df.columns:
+        logging.warning(
+            "No se calcularon promedios móviles: la columna GAME_DATE no está presente"
+        )
+    else:
+        if not pd.api.types.is_datetime64_any_dtype(gamelog_df["GAME_DATE"]):
+            gamelog_df["GAME_DATE"] = pd.to_datetime(
+                gamelog_df["GAME_DATE"], errors="coerce"
+            )
+        if gamelog_df["GAME_DATE"].isna().any():
+            logging.warning(
+                "Algunos valores de GAME_DATE son inválidos; sus rolling averages serán NaN"
+            )
+
+        sort_columns = ["TEAM_ID", "GAME_DATE"]
+        if "GAME_ID" in gamelog_df.columns:
+            sort_columns.append("GAME_ID")
+        sorted_gamelog = gamelog_df.sort_values(sort_columns).copy()
+
+        rolling_values = (
+            sorted_gamelog.groupby("TEAM_ID", group_keys=False)[rolling_source_columns]
+            .apply(lambda data: data.shift(1).rolling(window=10, min_periods=1).mean())
+            .reset_index(level=0, drop=True)
+        )
+        if isinstance(rolling_values, pd.Series):
+            rolling_values = rolling_values.to_frame()
+        rolling_values = rolling_values.add_prefix("ROLLING_")
+
+        rolling_features = pd.concat(
+            [
+                sorted_gamelog[["TEAM_ID", "GAME_ID"]].reset_index(drop=True),
+                rolling_values.reset_index(drop=True),
+            ],
+            axis=1,
+        )
+        rolling_features = rolling_features.drop_duplicates(
+            subset=["TEAM_ID", "GAME_ID"], keep="last"
+        )
+
+        gamelog_df = gamelog_df.merge(
+            rolling_features,
+            on=["TEAM_ID", "GAME_ID"],
+            how="left",
+        )
+
+        logging.info(
+            "Rolling averages agregadas: %d columnas (ventana=10, shift=1)",
+            len(rolling_source_columns),
+        )
+
     logging.info("Leyendo boxscores desde %s", args.boxscores)
     boxscores_df = ensure_string_keys(read_parquet(args.boxscores), KEY_COLUMNS)
 
