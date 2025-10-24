@@ -1,4 +1,6 @@
-"""Utility functions to compute basketball features and train win/loss estimators."""
+"""Utility functions to compute basketball features and train win/loss estimators.
+Versión con MERGE SEGURO para Days Rest usando clave string '_REST_KEY' = TEAM_ID|YYYY-MM-DD
+"""
 
 from __future__ import annotations
 
@@ -23,12 +25,13 @@ from xgboost import XGBClassifier
 
 DEFAULT_DAYS_REST = 5
 
-
 __all__ = [
     'DEFAULT_DAYS_REST',
+    'ensure_teamid_and_date',
     'features_roll10',
     'parse_days_rest_value',
     'load_days_rest_reference',
+    'add_days_rest_from_reference',
     'calculate_current_streak',
     'features_enhanced',
     'features_venue',
@@ -37,12 +40,47 @@ __all__ = [
 ]
 
 
+# =========================
+# Helpers de normalización
+# =========================
+def _flatten_scalar(x):
+    if isinstance(x, (list, tuple, np.ndarray, pd.Series)):
+        return x[0] if len(x) > 0 else np.nan
+    return x
+
+def _to_key_str(series: pd.Series) -> pd.Series:
+    s = series.astype(str).str.strip()
+    return s.str.replace(r"\.0$", "", regex=True)
+
+def ensure_teamid_and_date(df: pd.DataFrame, team_col: str = 'TEAM_ID', date_col: str = 'GAME_DATE') -> pd.DataFrame:
+    """Normaliza TEAM_ID a Int64 (nullable) y GAME_DATE a datetime (naive). Devuelve copia."""
+    d = df.copy()
+    if team_col in d.columns:
+        d[team_col] = d[team_col].map(_flatten_scalar)
+        d[team_col] = pd.to_numeric(d[team_col], errors='coerce').astype('Int64')
+    if date_col in d.columns:
+        d[date_col] = pd.to_datetime(d[date_col], errors='coerce')
+    return d
+
+def _build_rest_key(df: pd.DataFrame, team_col='TEAM_ID', date_col='GAME_DATE', key='_REST_KEY') -> pd.DataFrame:
+    """Crea una clave string segura TEAM_ID|YYYY-MM-DD para merges sin conflictos de dtype."""
+    d = df.copy()
+    if team_col not in d.columns or date_col not in d.columns:
+        raise ValueError(f"Para construir {key} faltan columnas: {team_col} y/o {date_col}.")
+    # Asegura tipos y luego pasa a string canónica
+    d = ensure_teamid_and_date(d, team_col=team_col, date_col=date_col)
+    team_str = _to_key_str(d[team_col].astype(object))
+    date_str = pd.to_datetime(d[date_col], errors='coerce').dt.strftime('%Y-%m-%d')
+    d[key] = team_str.fillna('NA') + '|' + date_str.fillna('NA')
+    return d
+
+
+# =========================
+# ROLL10 selector/limpieza
+# =========================
 def features_roll10(df: pd.DataFrame) -> pd.DataFrame:
     """Selects and cleans pre-computed rolling features with a 10-game window."""
-    df = df.copy()
-
-    if 'GAME_DATE' in df.columns:
-        df['GAME_DATE'] = pd.to_datetime(df['GAME_DATE'])
+    df = ensure_teamid_and_date(df)
 
     id_columns = [
         'TEAM_ID',
@@ -63,7 +101,7 @@ def features_roll10(df: pd.DataFrame) -> pd.DataFrame:
     selected = [c for c in id_columns if c in df.columns] + roll_features
     df = df[selected].copy()
 
-    if 'GAME_DATE' in df.columns:
+    if 'GAME_DATE' in df.columns and df['GAME_DATE'].notna().any():
         print(f"Filas totales tras selección: {len(df)}")
         print(
             "Rango de fechas tras selección: "
@@ -82,13 +120,16 @@ def features_roll10(df: pd.DataFrame) -> pd.DataFrame:
         for col in roll_cols:
             if df[col].isna().any():
                 df[col] = df[col].fillna(df[col].median())
-        print(f"Columnas ROLL10 imputadas (con la mediana): {len(roll_cols)}")
+        print(f"Columnas ROLL10 imputadas (mediana): {len(roll_cols)}")
 
     return df
 
 
+# =========================
+# Days Rest utilities
+# =========================
 def parse_days_rest_value(value):
-    """Converts the rest range text to a numeric approximation."""
+    """Converts the rest range text to a numeric approximation (simple)."""
     if value is None:
         return None
     if isinstance(value, (int, float)):
@@ -96,68 +137,109 @@ def parse_days_rest_value(value):
     text = str(value).strip()
     if not text:
         return None
-    match = re.search(r"\d+", text)
-    if match:
-        return float(match.group())
+    m = re.search(r"\d+", text)
+    if m:
+        return float(m.group())
     lowered = text.lower()
     if 'back' in lowered:
         return 0.0
     return None
 
-
 def load_days_rest_reference(path: str | Path) -> pd.DataFrame:
-    """Loads a parquet with rest information and normalises the key columns."""
+    """
+    Carga un parquet con información de descanso y lo normaliza.
+    Devuelve columnas: TEAM_ID, GAME_DATE, DAYS_REST_SOURCE, DAYS_REST_RANGE_SRC (si existiera)
+    """
     path = Path(path)
     if not path.exists():
-        print(
-            f"⚠️ No se encontró el parquet de days rest en {path}. "
-            "Se usará la diferencia de fechas como respaldo."
-        )
+        print(f"⚠️ No se encontró el parquet de days rest en {path}. Se usará la diferencia de fechas como respaldo.")
         return pd.DataFrame()
 
     rest_df = pd.read_parquet(path)
     if rest_df.empty:
         return pd.DataFrame()
 
+    # Detectar columnas clave
     team_col = None
-    for cand in ['TEAM_ID', 'TEAM_ID_x', 'TEAM_ID_y']:
+    for cand in ['TEAM_ID', 'TEAMID', 'TEAM_ID_x', 'TEAM_ID_y']:
         if cand in rest_df.columns:
             team_col = cand
             break
-    if team_col is None:
-        print("⚠️ El parquet de days rest no contiene TEAM_ID. Se omite el merge.")
-        return pd.DataFrame()
-
     date_col = None
     for cand in ['GAME_DATE', 'TEAM_GAME_DATE', 'DATE']:
         if cand in rest_df.columns:
             date_col = cand
             break
-    if date_col is None:
-        print("⚠️ El parquet de days rest no contiene GAME_DATE. Se omite el merge.")
-        return pd.DataFrame()
-
+    # rango en texto si existe
     range_col = None
     for cand in ['TEAM_DAYS_REST_RANGE', 'DAYS_REST_RANGE', 'TEAM_DAYS_REST']:
         if cand in rest_df.columns:
             range_col = cand
             break
-    if range_col is None:
-        print(
-            "⚠️ El parquet de days rest no contiene TEAM_DAYS_REST_RANGE. "
-            "Se omite el merge."
-        )
+
+    if team_col is None or date_col is None:
+        print("⚠️ El parquet de days rest no contiene TEAM_ID y/o GAME_DATE. Se omite.")
         return pd.DataFrame()
 
-    out = rest_df[[team_col, date_col, range_col]].copy()
-    out = out.rename(
-        columns={team_col: 'TEAM_ID', date_col: 'GAME_DATE', range_col: 'TEAM_DAYS_REST_RANGE'}
-    )
-    out['GAME_DATE'] = pd.to_datetime(out['GAME_DATE'])
-    out['DAYS_REST_SOURCE'] = out['TEAM_DAYS_REST_RANGE'].apply(parse_days_rest_value)
-    return out[['TEAM_ID', 'GAME_DATE', 'DAYS_REST_SOURCE']]
+    out = rest_df[[team_col, date_col] + ([range_col] if range_col else [])].copy()
+    out = out.rename(columns={team_col: 'TEAM_ID', date_col: 'GAME_DATE'})
+    out = ensure_teamid_and_date(out, team_col='TEAM_ID', date_col='GAME_DATE')
+
+    if range_col:
+        out['DAYS_REST_RANGE_SRC'] = out[range_col].astype(str).str.strip()
+        out['DAYS_REST_SOURCE'] = out['DAYS_REST_RANGE_SRC'].apply(parse_days_rest_value)
+    else:
+        out['DAYS_REST_RANGE_SRC'] = np.nan
+        out['DAYS_REST_SOURCE'] = np.nan
+
+    return out[['TEAM_ID', 'GAME_DATE', 'DAYS_REST_SOURCE', 'DAYS_REST_RANGE_SRC']]
 
 
+def add_days_rest_from_reference(df: pd.DataFrame, rest_df: pd.DataFrame) -> pd.DataFrame:
+    """
+    Merge SEGURO del parquet de descanso (rest_df) sobre df original.
+    Evita conflictos de dtype usando una clave canónica string: TEAM_ID|YYYY-MM-DD
+    """
+    if rest_df is None or rest_df.empty:
+        # Nada que añadir
+        return df
+
+    # Construir claves string en ambos
+    left = _build_rest_key(df, team_col='TEAM_ID', date_col='GAME_DATE', key='_REST_KEY')
+    right = _build_rest_key(rest_df, team_col='TEAM_ID', date_col='GAME_DATE', key='_REST_KEY')
+
+    # Reducir columnas del right a lo útil
+    right = right[['_REST_KEY'] + [c for c in ['DAYS_REST_SOURCE', 'DAYS_REST_RANGE_SRC'] if c in right.columns]].copy()
+
+    before = left.shape
+    merged = left.merge(right, how='left', on='_REST_KEY', suffixes=('', '_REF'))
+    after = merged.shape
+
+    # Limpiar clave auxiliar
+    merged = merged.drop(columns=['_REST_KEY'], errors='ignore')
+
+    # Si hay fuente, crear/actualizar columnas finales
+    if 'DAYS_REST_SOURCE' in merged.columns:
+        # Recalcular DAYS_REST / RANGE solo cuando venga info de referencia
+        has_src = merged['DAYS_REST_SOURCE'].notna()
+        # Capamos a [0..6]
+        merged.loc[has_src, 'DAYS_REST'] = (
+            pd.to_numeric(merged.loc[has_src, 'DAYS_REST_SOURCE'], errors='coerce')
+            .fillna(DEFAULT_DAYS_REST)
+            .clip(lower=0).clip(upper=6).astype(int)
+        )
+        # RANGE en texto
+        merged.loc[has_src, 'DAYS_REST_RANGE'] = merged.loc[has_src, 'DAYS_REST'].astype(int).astype(str) + ' Days Rest'
+
+    print(f"OK: Merge SEGURO de Days Rest aplicado (shape {before} -> {after}). "
+          f"Dtype TEAM_ID(df): {df['TEAM_ID'].dtype}, TEAM_ID(ref): {rest_df['TEAM_ID'].dtype}")
+
+    return merged
+
+
+# =========================
+# Streaks
+# =========================
 def calculate_current_streak(results: Sequence[float]) -> List[int]:
     """Calculates the pre-game streak based on past win/loss values."""
     streaks: List[int] = []
@@ -173,96 +255,101 @@ def calculate_current_streak(results: Sequence[float]) -> List[int]:
     return streaks
 
 
+# =========================
+# Features avanzadas
+# =========================
 def features_enhanced(df: pd.DataFrame, config: Dict[str, object]) -> pd.DataFrame:
-    """Generates advanced features for each team before every game."""
-    df = df.copy()
+    """
+    Genera features avanzadas por equipo y partido:
+      - WIN_STREAK, LAST_5_PCT
+      - SEASON_W_PCT, SEASON_WINS, SEASON_LOSSES
+      - DAYS_REST (diff capado a 6) y DAYS_REST_RANGE ("0..6 Days Rest"), con posible refuerzo por parquet externo
+      - PACE (de ROLL10_PACE) y TURNOVER_RATIO (ROLL10_TOV/ROLL10_POSS)
+    Si config contiene 'days_rest_path', intentará mergear esa referencia con clave segura (_REST_KEY).
+    """
+    d = ensure_teamid_and_date(df)
 
-    if 'GAME_DATE' not in df.columns:
+    if 'GAME_DATE' not in d.columns:
         raise ValueError('GAME_DATE es obligatorio para calcular las nuevas features.')
+    if 'TEAM_ID' not in d.columns:
+        raise ValueError('TEAM_ID es obligatorio para calcular las nuevas features.')
 
-    days_rest_path = str(config.get('days_rest_path', ''))
-    if days_rest_path:
-        days_rest_ref = load_days_rest_reference(days_rest_path)
-    else:
-        days_rest_ref = pd.DataFrame()
+    # WL_NUM (1=W, 0=L)
+    if 'WL_NUM' not in d.columns:
+        if 'WL' in d.columns:
+            d['WL_NUM'] = d['WL'].astype(str).str.strip().str.upper().map({'W': 1, 'L': 0})
+        else:
+            raise ValueError('Falta WL o WL_NUM.')
 
-    if not days_rest_ref.empty:
-        df = df.merge(days_rest_ref, on=['TEAM_ID', 'GAME_DATE'], how='left')
+    # PACE / TURNOVER_RATIO desde rollings si aplican
+    if 'ROLL10_PACE' in d.columns and 'PACE' not in d.columns:
+        d['PACE'] = d['ROLL10_PACE']
+    if 'ROLL10_TOV' in d.columns and 'ROLL10_POSS' in d.columns and 'TURNOVER_RATIO' not in d.columns:
+        ratio = d['ROLL10_TOV'] / d['ROLL10_POSS'].replace({0: np.nan})
+        d['TURNOVER_RATIO'] = ratio.replace([np.inf, -np.inf], np.nan)
 
-    if 'ROLL10_PACE' in df.columns and 'PACE' not in df.columns:
-        df['PACE'] = df['ROLL10_PACE']
-    if 'ROLL10_TOV' in df.columns and 'ROLL10_POSS' in df.columns:
-        ratio = df['ROLL10_TOV'] / df['ROLL10_POSS'].replace({0: np.nan})
-        df['TURNOVER_RATIO'] = ratio.replace([np.inf, -np.inf], np.nan)
-
+    # Detecta temporada si existe
     season_col = None
     for cand in ['SEASON_KEY', 'SEASON', 'SEASON_ID', 'SEASON_YEAR']:
-        if cand in df.columns:
+        if cand in d.columns:
             season_col = cand
             break
 
     group_cols = ['TEAM_ID'] + ([season_col] if season_col else [])
-    df = df.sort_values(group_cols + ['GAME_DATE'])
+    d = d.sort_values(group_cols + ['GAME_DATE'])
 
-    def process_group(group: pd.DataFrame) -> pd.DataFrame:
-        group = group.sort_values('GAME_DATE').copy()
-        results = group['WL_NUM'].astype(float)
-        prev_results = results.shift(1)
+    # === Procesado por grupo ===
+    def process_group(g: pd.DataFrame) -> pd.DataFrame:
+        g = g.sort_values('GAME_DATE').copy()
+        prev_results = g['WL_NUM'].astype(float).shift(1)
 
-        group['WIN_STREAK'] = calculate_current_streak(prev_results)
+        # racha previa (positiva en victorias, negativa en derrotas)
+        wins_flag = (prev_results == 1).astype(int).fillna(0)
+        g['WIN_STREAK'] = wins_flag * (wins_flag.groupby((wins_flag == 0).cumsum()).cumcount() + 1)
 
-        last5 = prev_results.rolling(5, min_periods=1).mean()
-        group['LAST_5_PCT'] = last5.fillna(0.5)
+        # % victorias últimos 5 previos
+        g['LAST_5_PCT'] = prev_results.rolling(5, min_periods=1).mean().fillna(0.5)
 
-        wins = prev_results.fillna(0).cumsum()
-        games = prev_results.expanding().count()
-        losses = games - wins
-        pct = wins.div(games.where(games > 0, np.nan))
-        group['SEASON_W_PCT'] = pct.fillna(0.5)
-        group['SEASON_WINS'] = wins
-        group['SEASON_LOSSES'] = losses
+        # acumulados temporada previos
+        wins_cum = prev_results.fillna(0).cumsum()
+        games_cum = prev_results.expanding().count()
+        losses_cum = games_cum - wins_cum
+        pct_prev = wins_cum.div(games_cum.where(games_cum > 0, np.nan))
+        g['SEASON_W_PCT'] = pct_prev.fillna(0.5)
+        g['SEASON_WINS'] = wins_cum
+        g['SEASON_LOSSES'] = losses_cum
 
-        if 'DAYS_REST_SOURCE' in group.columns:
-            group['DAYS_REST'] = group['DAYS_REST_SOURCE']
+        # descanso base por diferencia de fechas (capado 0..6)
+        days_rest = g['GAME_DATE'].diff().dt.days
+        g['DAYS_REST'] = days_rest.fillna(DEFAULT_DAYS_REST).clip(lower=0).clip(upper=6).astype(int)
+        g['DAYS_REST_RANGE'] = g['DAYS_REST'].astype(str) + ' Days Rest'
+        return g
+
+    d = d.groupby(group_cols, group_keys=False).apply(process_group).reset_index(drop=True)
+
+    # === Refuerzo con parquet de descanso (opcional) usando MERGE SEGURO ===
+    days_path = (config or {}).get('days_rest_path') if isinstance(config, dict) else None
+    if days_path:
+        ref = load_days_rest_reference(days_path)
+        if not ref.empty:
+            d = add_days_rest_from_reference(d, ref)
         else:
-            group['DAYS_REST'] = np.nan
-        fallback = group['GAME_DATE'].diff().dt.days
-        group['DAYS_REST'] = group['DAYS_REST'].fillna(fallback)
-        group['DAYS_REST'] = group['DAYS_REST'].fillna(DEFAULT_DAYS_REST).clip(lower=0)
+            print("⚠️ No se aplicó referencia externa de Days Rest (archivo vacío o inválido).")
 
-        return group
-
-    df = df.groupby(group_cols, group_keys=False).apply(process_group).reset_index(drop=True)
-    df = df.drop(columns=['DAYS_REST_SOURCE'], errors='ignore')
-
-    return df
+    return d
 
 
+# =========================
+# Venue splits (home/road)
+# =========================
 def features_venue(
     df: pd.DataFrame,
     venue_path: str = "/Users/pablo/Documents/BigData/BasketballAnalysis/00_data/00c_final/2024-25/dashboards/team_dashboard_by_general_splits__dataset_1.parquet",
 ) -> pd.DataFrame:
     """Merges home/road split information into the dataframe."""
-    df = df.copy()
+    df = ensure_teamid_and_date(df)
 
-    def _to_key_str(series: pd.Series) -> pd.Series:
-        s = series.astype(str).str.strip()
-        return s.str.replace(r"\.0$", "", regex=True)
-
-    def _flatten_scalar(x):
-        if isinstance(x, (list, tuple, np.ndarray, pd.Series)):
-            return x[0] if len(x) > 0 else np.nan
-        return x
-
-    if 'TEAM_ID' not in df.columns and 'team_id' in df.columns:
-        df = df.rename(columns={'team_id': 'TEAM_ID'})
-    elif 'TEAM_ID' in df.columns and 'team_id' in df.columns:
-        df = df.drop(columns=['team_id'], errors='ignore')
-
-    if 'TEAM_ID' not in df.columns:
-        raise ValueError('Tu df no tiene TEAM_ID para poder hacer el merge.')
-
-    df['TEAM_ID'] = df['TEAM_ID'].map(_flatten_scalar)
+    # Clave segura tipo string para merge
     df['_TEAM_KEY'] = _to_key_str(df['TEAM_ID'])
 
     venue_path = Path(venue_path)
@@ -283,7 +370,7 @@ def features_venue(
     if 'TEAM_ID' not in v.columns:
         raise ValueError(f"No se encontró TEAM_ID en el parquet. Columnas: {sorted(v.columns)}")
 
-    v['TEAM_ID'] = v['TEAM_ID'].map(_flatten_scalar)
+    v['TEAM_ID'] = pd.to_numeric(v['TEAM_ID'].map(_flatten_scalar), errors='coerce').astype('Int64')
     v['_TEAM_KEY'] = _to_key_str(v['TEAM_ID'])
 
     if 'W_PCT' not in v.columns:
@@ -304,14 +391,8 @@ def features_venue(
     v['GROUP_VALUE'] = v['GROUP_VALUE'].astype(str).str.strip().str.title()
 
     map_val = {
-        'Home': 'Home',
-        'Local': 'Home',
-        'Casa': 'Home',
-        'Road': 'Road',
-        'Away': 'Road',
-        'Visitor': 'Road',
-        'Visita': 'Road',
-        'Fuera': 'Road',
+        'Home': 'Home', 'Local': 'Home', 'Casa': 'Home',
+        'Road': 'Road', 'Away': 'Road', 'Visitor': 'Road', 'Visita': 'Road', 'Fuera': 'Road',
     }
     v['GROUP_VALUE'] = v['GROUP_VALUE'].map(lambda x: map_val.get(x, x))
 
@@ -357,6 +438,9 @@ def features_venue(
     return df
 
 
+# =========================
+# Match-level dataset
+# =========================
 def build_match_dataset_enhanced(
     df: pd.DataFrame,
     numeric_feature_prefixes: Sequence[str] = ("ROLL10_", "VENUE_"),
@@ -364,17 +448,14 @@ def build_match_dataset_enhanced(
 ) -> Tuple[pd.DataFrame, np.ndarray, pd.DataFrame]:
     """Builds the home/away match-level dataset with differential features."""
     d = df.copy()
-
     d['IS_HOME'] = d['MATCHUP'].astype(str).str.contains('vs', case=False).astype(int)
 
     home = d[d['IS_HOME'] == 1].copy().add_prefix('HOME_')
     away = d[d['IS_HOME'] == 0].copy().add_prefix('AWAY_')
 
     merged = pd.merge(
-        home,
-        away,
-        left_on='HOME_GAME_ID',
-        right_on='AWAY_GAME_ID',
+        home, away,
+        left_on='HOME_GAME_ID', right_on='AWAY_GAME_ID',
         how='inner',
     )
 
@@ -398,9 +479,7 @@ def build_match_dataset_enhanced(
     X_rel['HOME_COURT'] = 1
 
     if 'HOME_VENUE_HOME_W_PCT' in merged.columns and 'AWAY_VENUE_ROAD_W_PCT' in merged.columns:
-        X_rel['DIFF_VENUE_W_PCT'] = (
-            merged['HOME_VENUE_HOME_W_PCT'] - merged['AWAY_VENUE_ROAD_W_PCT']
-        )
+        X_rel['DIFF_VENUE_W_PCT'] = merged['HOME_VENUE_HOME_W_PCT'] - merged['AWAY_VENUE_ROAD_W_PCT']
 
     if advanced_features is None:
         advanced_features = [
@@ -453,13 +532,14 @@ def build_match_dataset_enhanced(
             continue
         if any(col.startswith(pref) for pref in allowed_prefixes):
             continue
-        raise AssertionError(
-            f'Se detectó una columna no permitida: {col}. Revisa los prefijos aceptados.'
-        )
+        raise AssertionError(f'Se detectó una columna no permitida: {col}. Revisa los prefijos aceptados.')
 
     return X_rel, y, meta
 
 
+# =========================
+# Train & Eval
+# =========================
 def fit_and_eval(
     X_tr: pd.DataFrame,
     X_val: pd.DataFrame,
