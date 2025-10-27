@@ -145,6 +145,21 @@ def parse_days_rest_value(value):
         return 0.0
     return None
 
+def _find_column_case_insensitive(columns: pd.Index, *aliases: str) -> str | None:
+    """Return the first matching column name regardless of case."""
+
+    col_map = {str(c).strip(): c for c in columns}
+    lower_map = {str(c).strip().lower(): c for c in columns}
+
+    for cand in aliases:
+        if cand in col_map:
+            return col_map[cand]
+        cand_lower = cand.lower()
+        if cand_lower in lower_map:
+            return lower_map[cand_lower]
+    return None
+
+
 def load_days_rest_reference(path: str | Path) -> pd.DataFrame:
     """
     Carga un parquet con información de descanso y lo normaliza.
@@ -160,25 +175,33 @@ def load_days_rest_reference(path: str | Path) -> pd.DataFrame:
         return pd.DataFrame()
 
     # Detectar columnas clave
-    team_col = None
-    for cand in ['TEAM_ID', 'TEAMID', 'TEAM_ID_x', 'TEAM_ID_y']:
-        if cand in rest_df.columns:
-            team_col = cand
-            break
-    date_col = None
-    for cand in ['GAME_DATE', 'TEAM_GAME_DATE', 'DATE']:
-        if cand in rest_df.columns:
-            date_col = cand
-            break
+    team_col = _find_column_case_insensitive(
+        rest_df.columns,
+        'TEAM_ID',
+        'TEAMID',
+        'TEAM_ID_x',
+        'TEAM_ID_y',
+    )
+    date_col = _find_column_case_insensitive(
+        rest_df.columns,
+        'GAME_DATE',
+        'TEAM_GAME_DATE',
+        'GAME_DATE_EST',
+        'DATE',
+    )
     # rango en texto si existe
-    range_col = None
-    for cand in ['TEAM_DAYS_REST_RANGE', 'DAYS_REST_RANGE', 'TEAM_DAYS_REST']:
-        if cand in rest_df.columns:
-            range_col = cand
-            break
+    range_col = _find_column_case_insensitive(
+        rest_df.columns,
+        'TEAM_DAYS_REST_RANGE',
+        'DAYS_REST_RANGE',
+        'TEAM_DAYS_REST',
+    )
 
     if team_col is None or date_col is None:
-        print("⚠️ El parquet de days rest no contiene TEAM_ID y/o GAME_DATE. Se omite.")
+        print(
+            "⚠️ El parquet de days rest no contiene TEAM_ID y/o GAME_DATE. Se omite. "
+            f"Columnas disponibles: {sorted(map(str, rest_df.columns))}"
+        )
         return pd.DataFrame()
 
     out = rest_df[[team_col, date_col] + ([range_col] if range_col else [])].copy()
