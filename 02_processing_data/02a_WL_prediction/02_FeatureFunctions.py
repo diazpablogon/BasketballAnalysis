@@ -26,6 +26,15 @@ from xgboost import XGBClassifier
 
 DEFAULT_DAYS_REST = 5
 
+# Métricas externas por días de descanso que se consideran útiles para el modelo.
+# Formato: columna_origen -> (función_agg, nombre_feature_destino)
+REST_METRIC_RULES: Dict[str, Tuple[str, str]] = {
+    'GP': ('sum', 'REST_BUCKET_GP'),
+    'W_PCT': ('mean', 'REST_BUCKET_WIN_PCT'),
+    'PLUS_MINUS': ('mean', 'REST_BUCKET_PLUS_MINUS'),
+    'PTS': ('mean', 'REST_BUCKET_POINTS'),
+}
+
 __all__ = [
     'DEFAULT_DAYS_REST',
     'ensure_teamid_and_date',
@@ -288,37 +297,26 @@ def load_days_rest_reference(path: str | Path) -> pd.DataFrame:
     )
     rest_df = rest_df.dropna(subset=['DAYS_REST_BUCKET'])
 
-    # Selecciona métricas numéricas
-    skip_cols = {
-        'TEAM_ID',
-        'REST_RANGE_LABEL',
-        'DAYS_REST_BUCKET',
-        group_set_col,
-        group_value_col,
-        'SEASON',
-        'SEASON_YEAR',
-        'SEASON_TYPE',
-        'DATASET',
-        'ENDPOINT',
-        'SOURCE_DATASET',
-        'SPLIT_TYPE',
-        'SPLIT_VALUE',
-    }
-    metric_cols: List[str] = []
-    for col in rest_df.columns:
-        if col in skip_cols or col is None:
-            continue
-        series = rest_df[col]
-        if ptypes.is_numeric_dtype(series):
-            metric_cols.append(col)
+    # Selecciona únicamente las métricas consideradas útiles
+    selected_metrics: Dict[str, Tuple[str, str]] = {}
+    for src_name, (agg_fn, alias) in REST_METRIC_RULES.items():
+        real_col = _find_column_case_insensitive(rest_df.columns, src_name)
+        if real_col:
+            selected_metrics[real_col] = (agg_fn, alias)
 
-    if not metric_cols:
+    if not selected_metrics:
         print(
-            "⚠️ El parquet de days rest no contiene métricas numéricas utilizables tras la limpieza."
+            "⚠️ El parquet de days rest no contiene las métricas necesarias ("
+            f"{sorted(REST_METRIC_RULES)})."
         )
         return pd.DataFrame()
 
-    agg_dict = {col: 'mean' for col in metric_cols}
+    metric_cols = list(selected_metrics.keys())
+
+    for col in metric_cols:
+        rest_df[col] = pd.to_numeric(rest_df[col], errors='coerce')
+
+    agg_dict = {col: selected_metrics[col][0] for col in metric_cols}
     agg_dict['REST_RANGE_LABEL'] = 'first'
 
     grouped = (
@@ -327,23 +325,20 @@ def load_days_rest_reference(path: str | Path) -> pd.DataFrame:
         .agg(agg_dict)
     )
 
-    rename_metrics = {
-        col: (col if col.upper().startswith('REST_') else f'REST_{col}')
-        for col in metric_cols
-    }
+    rename_metrics = {col: selected_metrics[col][1] for col in metric_cols}
 
     grouped = grouped.rename(columns=rename_metrics)
     grouped['REST_DAYS_VALUE'] = grouped['DAYS_REST_BUCKET'].astype(float)
 
     keep_cols = ['TEAM_ID', 'DAYS_REST_BUCKET', 'REST_RANGE_LABEL', 'REST_DAYS_VALUE']
-    metric_keep = [rename_metrics.get(col, col) for col in metric_cols]
-    keep_cols.extend(metric_keep)
+    keep_cols.extend(rename_metrics.values())
 
     grouped = grouped[keep_cols]
 
     print(
         "OK: Referencia de rendimiento por días de descanso cargada "
-        f"({len(grouped)} combinaciones TEAM_ID/bucket)."
+        f"({len(grouped)} combinaciones TEAM_ID/bucket). "
+        f"Métricas: {sorted(rename_metrics.values())}"
     )
 
     return grouped
@@ -480,11 +475,13 @@ def features_enhanced(df: pd.DataFrame, config: Dict[str, object]) -> pd.DataFra
         g['SEASON_W_PCT'] = pct_prev.fillna(0.5)
         g['SEASON_WINS'] = wins_cum
         g['SEASON_LOSSES'] = losses_cum
+        g['RECENT_FORM_DELTA'] = g['LAST_5_PCT'] - g['SEASON_W_PCT']
 
         # descanso base por diferencia de fechas (capado 0..6)
         days_rest = g['GAME_DATE'].diff().dt.days
         g['DAYS_REST'] = days_rest.fillna(DEFAULT_DAYS_REST).clip(lower=0).clip(upper=6).astype(int)
         g['DAYS_REST_BUCKET'] = g['DAYS_REST'].clip(lower=0).astype(int)
+        g['BACK_TO_BACK_FLAG'] = (g['DAYS_REST'] == 0).astype(int)
 
         def _format_range(v: object) -> Optional[str]:
             if pd.isna(v):
@@ -508,8 +505,43 @@ def features_enhanced(df: pd.DataFrame, config: Dict[str, object]) -> pd.DataFra
         ref = load_days_rest_reference(days_path)
         if not ref.empty:
             d = add_days_rest_from_reference(d, ref)
+            if 'REST_BUCKET_WIN_PCT' in d.columns:
+                d['REST_BUCKET_WIN_PCT'] = pd.to_numeric(
+                    d['REST_BUCKET_WIN_PCT'], errors='coerce'
+                )
+                d['REST_BUCKET_WIN_PCT_DELTA'] = d['REST_BUCKET_WIN_PCT'] - d['SEASON_W_PCT']
+            if 'REST_BUCKET_POINTS' in d.columns:
+                d['REST_BUCKET_POINTS'] = pd.to_numeric(
+                    d['REST_BUCKET_POINTS'], errors='coerce'
+                )
+            if 'REST_BUCKET_PLUS_MINUS' in d.columns:
+                d['REST_BUCKET_PLUS_MINUS'] = pd.to_numeric(
+                    d['REST_BUCKET_PLUS_MINUS'], errors='coerce'
+                )
         else:
             print("⚠️ No se aplicó referencia externa de Days Rest (archivo vacío o inválido).")
+
+    if isinstance(config, dict):
+        feature_list = config.setdefault('new_features', [])
+        if isinstance(feature_list, list):
+            desired = [
+                'WIN_STREAK',
+                'LAST_5_PCT',
+                'DAYS_REST',
+                'SEASON_W_PCT',
+                'TURNOVER_RATIO',
+                'PACE',
+                'RECENT_FORM_DELTA',
+                'BACK_TO_BACK_FLAG',
+                'REST_BUCKET_GP',
+                'REST_BUCKET_WIN_PCT',
+                'REST_BUCKET_WIN_PCT_DELTA',
+                'REST_BUCKET_PLUS_MINUS',
+                'REST_BUCKET_POINTS',
+            ]
+            for feat in desired:
+                if feat in d.columns and feat not in feature_list:
+                    feature_list.append(feat)
 
     return d
 
