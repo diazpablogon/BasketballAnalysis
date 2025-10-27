@@ -146,6 +146,36 @@ def parse_days_rest_value(value):
         return 0.0
     return None
 
+
+def _normalize_rest_range_label(value: object) -> Optional[str]:
+    """Normaliza etiquetas como "1 Day Rest"/"3+ Days Rest" -> formato consistente."""
+
+    if value is None:
+        return None
+
+    text = str(value).strip()
+    if not text:
+        return None
+
+    lowered = text.lower()
+    if 'back' in lowered:
+        return '0 Days Rest'
+
+    num = parse_days_rest_value(text)
+    if num is None:
+        return text.title()
+
+    is_plus = '+' in text or 'plus' in lowered or 'more' in lowered or '>=' in lowered
+
+    num_int = int(max(0, round(num)))
+    if is_plus and num_int >= 0:
+        return f"{num_int}+ Days Rest"
+
+    if num_int == 1:
+        return '1 Day Rest'
+
+    return f"{num_int} Days Rest"
+
 def _find_column_case_insensitive(columns: pd.Index, *aliases: str) -> str | None:
     """Return the first matching column name regardless of case."""
 
@@ -184,34 +214,30 @@ def _infer_datetime_column(df: pd.DataFrame, *, min_valid_ratio: float = 0.6) ->
 
 def load_days_rest_reference(path: str | Path) -> pd.DataFrame:
     """
-    Carga un parquet con información de descanso y lo normaliza.
-    Devuelve columnas: TEAM_ID, GAME_DATE, DAYS_REST_SOURCE, DAYS_REST_RANGE_SRC (si existiera)
+    Carga un parquet con splits de rendimiento por días de descanso.
+
+    Devuelve columnas agregadas por TEAM_ID + bucket de descanso (DAYS_REST_BUCKET).
+    Incluye métricas prefijadas con REST_ (por ejemplo REST_W_PCT) cuando estén disponibles.
     """
+
     path = Path(path)
     if not path.exists():
-        print(f"⚠️ No se encontró el parquet de days rest en {path}. Se usará la diferencia de fechas como respaldo.")
+        print(
+            f"⚠️ No se encontró el parquet de days rest en {path}. Se usará la diferencia de fechas como respaldo."
+        )
         return pd.DataFrame()
 
     rest_df = pd.read_parquet(path)
     if rest_df.empty:
         return pd.DataFrame()
 
-    # Detectar columnas clave
-    team_col = _find_column_case_insensitive(
-        rest_df.columns,
-        'TEAM_ID',
-        'TEAMID',
-        'TEAM_ID_x',
-        'TEAM_ID_y',
-    )
-    date_col = _find_column_case_insensitive(
-        rest_df.columns,
-        'GAME_DATE',
-        'TEAM_GAME_DATE',
-        'GAME_DATE_EST',
-        'DATE',
-    )
-    # rango en texto si existe
+    # Normaliza nombres para detección case-insensitive
+    rest_df = rest_df.copy()
+    rest_df.columns = [str(c).strip() for c in rest_df.columns]
+
+    team_col = _find_column_case_insensitive(rest_df.columns, 'TEAM_ID', 'TEAMID')
+    group_set_col = _find_column_case_insensitive(rest_df.columns, 'GROUP_SET')
+    group_value_col = _find_column_case_insensitive(rest_df.columns, 'GROUP_VALUE')
     range_col = _find_column_case_insensitive(
         rest_df.columns,
         'TEAM_DAYS_REST_RANGE',
@@ -219,98 +245,155 @@ def load_days_rest_reference(path: str | Path) -> pd.DataFrame:
         'TEAM_DAYS_REST',
     )
 
-    if date_col is None:
-        inferred = _infer_datetime_column(rest_df)
-        if inferred is not None:
-            date_col = inferred
+    if range_col is None and group_set_col and group_value_col:
+        mask = (
+            rest_df[group_set_col]
+            .astype(str)
+            .str.strip()
+            .str.lower()
+            .eq('team_days_rest_range')
+        )
+        filtered = rest_df.loc[mask].copy()
+        if filtered.empty:
             print(
-                "ℹ️ No se encontró alias directo de GAME_DATE en el parquet de days rest; "
-                f"se utilizará la columna '{date_col}' inferida automáticamente."
+                "⚠️ El parquet de days rest no contiene filas con GROUP_SET == 'team_days_rest_range'."
             )
+            return pd.DataFrame()
+        rest_df = filtered
+        range_col = group_value_col
 
-    missing = [name for name, col in {'TEAM_ID': team_col, 'GAME_DATE': date_col}.items() if col is None]
-    if missing:
+    if team_col is None or range_col is None:
+        missing = []
+        if team_col is None:
+            missing.append('TEAM_ID')
+        if range_col is None:
+            missing.append('TEAM_DAYS_REST_RANGE')
         print(
             "⚠️ El parquet de days rest no contiene las columnas requeridas "
             f"{', '.join(missing)}. Se omite. Columnas disponibles: {sorted(map(str, rest_df.columns))}"
         )
         return pd.DataFrame()
 
-    out = rest_df[[team_col, date_col] + ([range_col] if range_col else [])].copy()
-    out = out.rename(columns={team_col: 'TEAM_ID', date_col: 'GAME_DATE'})
-    out = ensure_teamid_and_date(out, team_col='TEAM_ID', date_col='GAME_DATE')
+    rest_df = rest_df.rename(columns={team_col: 'TEAM_ID', range_col: 'REST_RANGE_LABEL'})
+    rest_df['TEAM_ID'] = pd.to_numeric(rest_df['TEAM_ID'].map(_flatten_scalar), errors='coerce').astype('Int64')
+    rest_df = rest_df.dropna(subset=['TEAM_ID'])
 
-    if range_col:
-        out['DAYS_REST_RANGE_SRC'] = out[range_col].astype(str).str.strip()
-        out['DAYS_REST_SOURCE'] = out['DAYS_REST_RANGE_SRC'].apply(parse_days_rest_value)
-    else:
-        out['DAYS_REST_RANGE_SRC'] = np.nan
-        out['DAYS_REST_SOURCE'] = np.nan
+    rest_df['REST_RANGE_LABEL'] = rest_df['REST_RANGE_LABEL'].map(_normalize_rest_range_label)
+    rest_df = rest_df.dropna(subset=['REST_RANGE_LABEL'])
 
-    return out[['TEAM_ID', 'GAME_DATE', 'DAYS_REST_SOURCE', 'DAYS_REST_RANGE_SRC']]
+    # Calcula bucket numérico para merge (p.e. 3+ Days Rest -> 3)
+    rest_df['DAYS_REST_BUCKET'] = rest_df['REST_RANGE_LABEL'].map(parse_days_rest_value)
+    rest_df['DAYS_REST_BUCKET'] = (
+        pd.to_numeric(rest_df['DAYS_REST_BUCKET'], errors='coerce').round().astype('Int64')
+    )
+    rest_df = rest_df.dropna(subset=['DAYS_REST_BUCKET'])
+
+    # Selecciona métricas numéricas
+    skip_cols = {
+        'TEAM_ID',
+        'REST_RANGE_LABEL',
+        'DAYS_REST_BUCKET',
+        group_set_col,
+        group_value_col,
+        'SEASON',
+        'SEASON_YEAR',
+        'SEASON_TYPE',
+        'DATASET',
+        'ENDPOINT',
+        'SOURCE_DATASET',
+        'SPLIT_TYPE',
+        'SPLIT_VALUE',
+    }
+    metric_cols: List[str] = []
+    for col in rest_df.columns:
+        if col in skip_cols or col is None:
+            continue
+        series = rest_df[col]
+        if ptypes.is_numeric_dtype(series):
+            metric_cols.append(col)
+
+    if not metric_cols:
+        print(
+            "⚠️ El parquet de days rest no contiene métricas numéricas utilizables tras la limpieza."
+        )
+        return pd.DataFrame()
+
+    agg_dict = {col: 'mean' for col in metric_cols}
+    agg_dict['REST_RANGE_LABEL'] = 'first'
+
+    grouped = (
+        rest_df[['TEAM_ID', 'DAYS_REST_BUCKET', 'REST_RANGE_LABEL'] + metric_cols]
+        .groupby(['TEAM_ID', 'DAYS_REST_BUCKET'], as_index=False)
+        .agg(agg_dict)
+    )
+
+    rename_metrics = {
+        col: (col if col.upper().startswith('REST_') else f'REST_{col}')
+        for col in metric_cols
+    }
+
+    grouped = grouped.rename(columns=rename_metrics)
+    grouped['REST_DAYS_VALUE'] = grouped['DAYS_REST_BUCKET'].astype(float)
+
+    keep_cols = ['TEAM_ID', 'DAYS_REST_BUCKET', 'REST_RANGE_LABEL', 'REST_DAYS_VALUE']
+    metric_keep = [rename_metrics.get(col, col) for col in metric_cols]
+    keep_cols.extend(metric_keep)
+
+    grouped = grouped[keep_cols]
+
+    print(
+        "OK: Referencia de rendimiento por días de descanso cargada "
+        f"({len(grouped)} combinaciones TEAM_ID/bucket)."
+    )
+
+    return grouped
 
 
 def add_days_rest_from_reference(df: pd.DataFrame, rest_df: pd.DataFrame) -> pd.DataFrame:
     """
-    Merge SEGURO del parquet de descanso (rest_df) sobre df original.
-    Evita conflictos de dtype usando una clave canónica string: TEAM_ID|YYYY-MM-DD
+    Combina el dataframe principal con métricas externas por días de descanso.
+
+    Se hace merge por TEAM_ID + DAYS_REST_BUCKET para evitar depender de GAME_DATE.
     """
+
     if rest_df is None or rest_df.empty:
-        # Nada que añadir
         return df
 
-    # Construir claves string en ambos
-    left = _build_rest_key(df, team_col='TEAM_ID', date_col='GAME_DATE', key='_REST_KEY')
-    right = _build_rest_key(rest_df, team_col='TEAM_ID', date_col='GAME_DATE', key='_REST_KEY')
-
-    # Reducir columnas del right a lo útil
-    right = right[['_REST_KEY'] + [c for c in ['DAYS_REST_SOURCE', 'DAYS_REST_RANGE_SRC'] if c in right.columns]].copy()
-
-    before = left.shape
-
-    def _merge_on_rest_key(left_df: pd.DataFrame, right_df: pd.DataFrame) -> pd.DataFrame:
-        return left_df.merge(right_df, how='left', on='_REST_KEY', suffixes=('', '_REF'))
-
-    try:
-        merged = _merge_on_rest_key(left, right)
-    except TypeError as exc:
-        msg = str(exc)
-        if "TEAM_ID" not in msg:
-            raise
-
-        # Fallback: forzar clave como string explícita para evitar conflictos de dtype
-        left_tmp = left.copy()
-        right_tmp = right.copy()
-        left_tmp['_REST_KEY'] = left_tmp['_REST_KEY'].astype(str)
-        right_tmp['_REST_KEY'] = right_tmp['_REST_KEY'].astype(str)
+    required = {'TEAM_ID', 'DAYS_REST_BUCKET'}
+    if not required.issubset(rest_df.columns):
         print(
-            "⚠️ Merge de Days Rest requirió conversión adicional de clave a string "
-            "por conflicto de dtype en TEAM_ID."
+            "⚠️ La referencia de days rest no tiene las columnas requeridas "
+            f"{sorted(required)}. Columnas reales: {sorted(rest_df.columns)}"
         )
-        merged = _merge_on_rest_key(left_tmp, right_tmp)
+        return df
 
-    after = merged.shape
-
-    # Limpiar clave auxiliar
-    merged = merged.drop(columns=['_REST_KEY'], errors='ignore')
-
-    # Si hay fuente, crear/actualizar columnas finales
-    if 'DAYS_REST_SOURCE' in merged.columns:
-        # Recalcular DAYS_REST / RANGE solo cuando venga info de referencia
-        has_src = merged['DAYS_REST_SOURCE'].notna()
-        # Capamos a [0..6]
-        merged.loc[has_src, 'DAYS_REST'] = (
-            pd.to_numeric(merged.loc[has_src, 'DAYS_REST_SOURCE'], errors='coerce')
-            .fillna(DEFAULT_DAYS_REST)
-            .clip(lower=0).clip(upper=6).astype(int)
+    if not required.issubset(df.columns):
+        print(
+            "⚠️ El dataframe base no tiene columnas para merge de days rest. Se omite merge externo."
         )
-        # RANGE en texto
-        merged.loc[has_src, 'DAYS_REST_RANGE'] = merged.loc[has_src, 'DAYS_REST'].astype(int).astype(str) + ' Days Rest'
+        return df
+
+    left = df.copy()
+    if 'DAYS_REST_BUCKET' in left.columns:
+        min_bucket = rest_df['DAYS_REST_BUCKET'].min()
+        max_bucket = rest_df['DAYS_REST_BUCKET'].max()
+        if pd.notna(min_bucket) and pd.notna(max_bucket):
+            left['DAYS_REST_BUCKET'] = (
+                pd.to_numeric(left['DAYS_REST_BUCKET'], errors='coerce')
+                .round()
+                .clip(lower=int(min_bucket), upper=int(max_bucket))
+                .astype('Int64')
+            )
+
+    before_shape = left.shape
+    merged = left.merge(rest_df, how='left', on=['TEAM_ID', 'DAYS_REST_BUCKET'])
+    after_shape = merged.shape
+
+    added_cols = [c for c in merged.columns if c not in df.columns]
 
     print(
-        "OK: Merge SEGURO de Days Rest aplicado (shape "
-        f"{before} -> {after}). Dtype TEAM_ID(df): {df['TEAM_ID'].dtype}, "
-        f"TEAM_ID(ref): {rest_df['TEAM_ID'].dtype}"
+        "OK: Referencia externa de Days Rest mergeada por TEAM_ID + bucket "
+        f"({before_shape} -> {after_shape}). Columnas añadidas: {added_cols}"
     )
 
     return merged
@@ -401,7 +484,20 @@ def features_enhanced(df: pd.DataFrame, config: Dict[str, object]) -> pd.DataFra
         # descanso base por diferencia de fechas (capado 0..6)
         days_rest = g['GAME_DATE'].diff().dt.days
         g['DAYS_REST'] = days_rest.fillna(DEFAULT_DAYS_REST).clip(lower=0).clip(upper=6).astype(int)
-        g['DAYS_REST_RANGE'] = g['DAYS_REST'].astype(str) + ' Days Rest'
+        g['DAYS_REST_BUCKET'] = g['DAYS_REST'].clip(lower=0).astype(int)
+
+        def _format_range(v: object) -> Optional[str]:
+            if pd.isna(v):
+                return None
+            try:
+                value = int(v)
+            except (TypeError, ValueError):
+                return None
+            if value == 1:
+                return '1 Day Rest'
+            return f'{value} Days Rest'
+
+        g['DAYS_REST_RANGE'] = g['DAYS_REST'].map(_format_range)
         return g
 
     d = d.groupby(group_cols, group_keys=False).apply(process_group).reset_index(drop=True)
