@@ -10,6 +10,7 @@ from typing import Dict, List, Optional, Sequence, Tuple
 
 import numpy as np
 import pandas as pd
+from pandas.api import types as ptypes
 from sklearn.metrics import (
     average_precision_score,
     brier_score_loss,
@@ -160,6 +161,27 @@ def _find_column_case_insensitive(columns: pd.Index, *aliases: str) -> str | Non
     return None
 
 
+def _infer_datetime_column(df: pd.DataFrame, *, min_valid_ratio: float = 0.6) -> str | None:
+    """Try to infer a datetime column when an explicit alias is not available."""
+
+    for col in df.columns:
+        series = df[col]
+
+        if ptypes.is_datetime64_any_dtype(series):
+            return col
+
+        if not (ptypes.is_object_dtype(series) or ptypes.is_string_dtype(series)):
+            # Avoid trying to coerce rank/metric numeric columns which can produce bogus datetimes.
+            continue
+
+        parsed = pd.to_datetime(series, errors='coerce', utc=True)
+        valid_ratio = parsed.notna().mean()
+        if valid_ratio >= min_valid_ratio and parsed.notna().any():
+            return col
+
+    return None
+
+
 def load_days_rest_reference(path: str | Path) -> pd.DataFrame:
     """
     Carga un parquet con información de descanso y lo normaliza.
@@ -197,10 +219,20 @@ def load_days_rest_reference(path: str | Path) -> pd.DataFrame:
         'TEAM_DAYS_REST',
     )
 
-    if team_col is None or date_col is None:
+    if date_col is None:
+        inferred = _infer_datetime_column(rest_df)
+        if inferred is not None:
+            date_col = inferred
+            print(
+                "ℹ️ No se encontró alias directo de GAME_DATE en el parquet de days rest; "
+                f"se utilizará la columna '{date_col}' inferida automáticamente."
+            )
+
+    missing = [name for name, col in {'TEAM_ID': team_col, 'GAME_DATE': date_col}.items() if col is None]
+    if missing:
         print(
-            "⚠️ El parquet de days rest no contiene TEAM_ID y/o GAME_DATE. Se omite. "
-            f"Columnas disponibles: {sorted(map(str, rest_df.columns))}"
+            "⚠️ El parquet de days rest no contiene las columnas requeridas "
+            f"{', '.join(missing)}. Se omite. Columnas disponibles: {sorted(map(str, rest_df.columns))}"
         )
         return pd.DataFrame()
 
