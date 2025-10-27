@@ -212,7 +212,28 @@ def add_days_rest_from_reference(df: pd.DataFrame, rest_df: pd.DataFrame) -> pd.
     right = right[['_REST_KEY'] + [c for c in ['DAYS_REST_SOURCE', 'DAYS_REST_RANGE_SRC'] if c in right.columns]].copy()
 
     before = left.shape
-    merged = left.merge(right, how='left', on='_REST_KEY', suffixes=('', '_REF'))
+
+    def _merge_on_rest_key(left_df: pd.DataFrame, right_df: pd.DataFrame) -> pd.DataFrame:
+        return left_df.merge(right_df, how='left', on='_REST_KEY', suffixes=('', '_REF'))
+
+    try:
+        merged = _merge_on_rest_key(left, right)
+    except TypeError as exc:
+        msg = str(exc)
+        if "TEAM_ID" not in msg:
+            raise
+
+        # Fallback: forzar clave como string explícita para evitar conflictos de dtype
+        left_tmp = left.copy()
+        right_tmp = right.copy()
+        left_tmp['_REST_KEY'] = left_tmp['_REST_KEY'].astype(str)
+        right_tmp['_REST_KEY'] = right_tmp['_REST_KEY'].astype(str)
+        print(
+            "⚠️ Merge de Days Rest requirió conversión adicional de clave a string "
+            "por conflicto de dtype en TEAM_ID."
+        )
+        merged = _merge_on_rest_key(left_tmp, right_tmp)
+
     after = merged.shape
 
     # Limpiar clave auxiliar
@@ -231,8 +252,11 @@ def add_days_rest_from_reference(df: pd.DataFrame, rest_df: pd.DataFrame) -> pd.
         # RANGE en texto
         merged.loc[has_src, 'DAYS_REST_RANGE'] = merged.loc[has_src, 'DAYS_REST'].astype(int).astype(str) + ' Days Rest'
 
-    print(f"OK: Merge SEGURO de Days Rest aplicado (shape {before} -> {after}). "
-          f"Dtype TEAM_ID(df): {df['TEAM_ID'].dtype}, TEAM_ID(ref): {rest_df['TEAM_ID'].dtype}")
+    print(
+        "OK: Merge SEGURO de Days Rest aplicado (shape "
+        f"{before} -> {after}). Dtype TEAM_ID(df): {df['TEAM_ID'].dtype}, "
+        f"TEAM_ID(ref): {rest_df['TEAM_ID'].dtype}"
+    )
 
     return merged
 
