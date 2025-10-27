@@ -525,19 +525,9 @@ def features_enhanced(df: pd.DataFrame, config: Dict[str, object]) -> pd.DataFra
         feature_list = config.setdefault('new_features', [])
         if isinstance(feature_list, list):
             desired = [
-                'WIN_STREAK',
-                'LAST_5_PCT',
                 'DAYS_REST',
-                'SEASON_W_PCT',
-                'TURNOVER_RATIO',
-                'PACE',
-                'RECENT_FORM_DELTA',
+                'LAST_5_PCT',
                 'BACK_TO_BACK_FLAG',
-                'REST_BUCKET_GP',
-                'REST_BUCKET_WIN_PCT',
-                'REST_BUCKET_WIN_PCT_DELTA',
-                'REST_BUCKET_PLUS_MINUS',
-                'REST_BUCKET_POINTS',
             ]
             for feat in desired:
                 if feat in d.columns and feat not in feature_list:
@@ -669,6 +659,7 @@ def build_match_dataset_enhanced(
     merged['y'] = (merged['HOME_WL'].astype(str).str.upper().str.strip() == 'W').astype(int)
 
     bases: List[str] = []
+    extra_meta: Dict[str, pd.Series] = {}
     for col in merged.columns:
         if not (col.startswith('HOME_') or col.startswith('AWAY_')):
             continue
@@ -689,14 +680,7 @@ def build_match_dataset_enhanced(
         X_rel['DIFF_VENUE_W_PCT'] = merged['HOME_VENUE_HOME_W_PCT'] - merged['AWAY_VENUE_ROAD_W_PCT']
 
     if advanced_features is None:
-        advanced_features = [
-            'WIN_STREAK',
-            'LAST_5_PCT',
-            'DAYS_REST',
-            'SEASON_W_PCT',
-            'PACE',
-            'TURNOVER_RATIO',
-        ]
+        advanced_features = []
 
     for feat in advanced_features:
         h_feat = f'HOME_{feat}'
@@ -704,10 +688,22 @@ def build_match_dataset_enhanced(
         if h_feat in merged.columns and a_feat in merged.columns:
             X_rel[f'DIFF_{feat}'] = merged[h_feat] - merged[a_feat]
 
-    if 'HOME_DAYS_REST' in merged.columns and 'AWAY_DAYS_REST' in merged.columns:
-        home_b2b = (merged['HOME_DAYS_REST'].fillna(DEFAULT_DAYS_REST) == 0).astype(int)
-        away_b2b = (merged['AWAY_DAYS_REST'].fillna(DEFAULT_DAYS_REST) == 0).astype(int)
-        X_rel['B2B_ADVANTAGE'] = away_b2b - home_b2b
+    if {'HOME_DAYS_REST', 'AWAY_DAYS_REST'}.issubset(merged.columns):
+        home_rest = pd.to_numeric(merged['HOME_DAYS_REST'], errors='coerce').fillna(DEFAULT_DAYS_REST)
+        away_rest = pd.to_numeric(merged['AWAY_DAYS_REST'], errors='coerce').fillna(DEFAULT_DAYS_REST)
+        X_rel['DIFF_DAYS_REST'] = home_rest - away_rest
+
+        home_b2b = (home_rest == 0).astype(int)
+        away_b2b = (away_rest == 0).astype(int)
+        X_rel['DIFF_B2B_FLAG'] = home_b2b - away_b2b
+
+        extra_meta['HOME_B2B_FLAG'] = home_b2b
+        extra_meta['AWAY_B2B_FLAG'] = away_b2b
+
+    if {'HOME_LAST_5_PCT', 'AWAY_LAST_5_PCT'}.issubset(merged.columns):
+        home_last5 = pd.to_numeric(merged['HOME_LAST_5_PCT'], errors='coerce')
+        away_last5 = pd.to_numeric(merged['AWAY_LAST_5_PCT'], errors='coerce')
+        X_rel['DIFF_LAST_5_PCT'] = home_last5.fillna(0.5) - away_last5.fillna(0.5)
 
     y = merged['y'].values
 
@@ -722,17 +718,13 @@ def build_match_dataset_enhanced(
     ]
     aux_cols = [c for c in aux_cols if c in merged.columns]
     meta = merged[aux_cols].copy()
+    for col_name, series in extra_meta.items():
+        meta[col_name] = series.values
 
-    allowed_exact = {'HOME_COURT', 'B2B_ADVANTAGE'}
+    allowed_exact = {'HOME_COURT', 'DIFF_DAYS_REST', 'DIFF_LAST_5_PCT', 'DIFF_B2B_FLAG'}
     allowed_prefixes = (
         'DIFF_ROLL10_',
         'DIFF_VENUE_',
-        'DIFF_WIN_STREAK',
-        'DIFF_LAST_5_PCT',
-        'DIFF_DAYS_REST',
-        'DIFF_SEASON_',
-        'DIFF_PACE',
-        'DIFF_TURNOVER_RATIO',
     )
     for col in X_rel.columns:
         if col in allowed_exact:
