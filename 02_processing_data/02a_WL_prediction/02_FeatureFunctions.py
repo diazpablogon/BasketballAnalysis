@@ -778,13 +778,54 @@ def fit_and_eval(
     proba_val = model.predict_proba(X_val, **use_ntree_limit)[:, 1]
     proba_test = model.predict_proba(X_test, **use_ntree_limit)[:, 1]
 
-    fpr_val, tpr_val, thresholds_val = roc_curve(y_val, proba_val)
-    youden_scores = tpr_val - fpr_val
-    best_idx = int(np.argmax(youden_scores))
-    if 0 <= best_idx < len(thresholds_val) and np.isfinite(thresholds_val[best_idx]):
-        best_thresh = float(thresholds_val[best_idx])
-    else:
+    strategy = 'youden'
+    if isinstance(model_name, str) and 'enhanced' in model_name.lower():
+        strategy = 'min_error'
+
+    if strategy == 'min_error':
+        threshold_candidates = np.linspace(0.0, 1.0, 2001)
         best_thresh = 0.5
+        best_error = np.inf
+        best_bal_acc = -np.inf
+        best_balance_gap = np.inf
+
+        for thr in threshold_candidates:
+            preds_val = (proba_val >= thr).astype(int)
+            tn, fp, fn, tp = confusion_matrix(y_val, preds_val, labels=[0, 1]).ravel()
+
+            error = fp + fn
+            tpr = tp / (tp + fn) if (tp + fn) > 0 else 0.0
+            tnr = tn / (tn + fp) if (tn + fp) > 0 else 0.0
+            bal_acc = 0.5 * (tpr + tnr)
+            balance_gap = abs(tp - tn)
+
+            if (
+                error < best_error
+                or (np.isclose(error, best_error) and bal_acc > best_bal_acc + 1e-6)
+                or (
+                    np.isclose(error, best_error)
+                    and np.isclose(bal_acc, best_bal_acc)
+                    and balance_gap < best_balance_gap - 1e-6
+                )
+                or (
+                    np.isclose(error, best_error)
+                    and np.isclose(bal_acc, best_bal_acc)
+                    and np.isclose(balance_gap, best_balance_gap)
+                    and abs(thr - 0.5) < abs(best_thresh - 0.5)
+                )
+            ):
+                best_error = error
+                best_bal_acc = bal_acc
+                best_balance_gap = balance_gap
+                best_thresh = float(thr)
+    else:
+        fpr_val, tpr_val, thresholds_val = roc_curve(y_val, proba_val)
+        youden_scores = tpr_val - fpr_val
+        best_idx = int(np.argmax(youden_scores))
+        if 0 <= best_idx < len(thresholds_val) and np.isfinite(thresholds_val[best_idx]):
+            best_thresh = float(thresholds_val[best_idx])
+        else:
+            best_thresh = 0.5
 
     y_pred = (proba_test >= best_thresh).astype(int)
     cm = confusion_matrix(y_test, y_pred)
