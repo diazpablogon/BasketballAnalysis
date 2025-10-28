@@ -722,10 +722,8 @@ def build_match_dataset_enhanced(
         meta[col_name] = series.values
 
     allowed_exact = {'HOME_COURT', 'DIFF_DAYS_REST', 'DIFF_LAST_5_PCT', 'DIFF_B2B_FLAG'}
-    allowed_prefixes = (
-        'DIFF_ROLL10_',
-        'DIFF_VENUE_',
-    )
+    allowed_prefixes = list(numeric_feature_prefixes) + ['HOME_COURT', 'DIFF_']
+
     for col in X_rel.columns:
         if col in allowed_exact:
             continue
