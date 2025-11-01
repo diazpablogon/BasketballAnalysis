@@ -4,6 +4,7 @@ Versión con MERGE SEGURO para Days Rest usando clave string '_REST_KEY' = TEAM_
 
 from __future__ import annotations
 
+import logging
 import re
 from pathlib import Path
 from typing import Dict, List, Optional, Sequence, Tuple
@@ -24,7 +25,16 @@ from sklearn.metrics import (
 )
 from xgboost import XGBClassifier
 
+logger = logging.getLogger(__name__)
+
 DEFAULT_DAYS_REST = 5
+
+DEFAULT_LINEUP_CONFIG = {
+    'N_ROLL_MIN': 5,
+    'TEAM_PCTL': (5, 95),
+    'USE_ON_OFF': True,
+    'USE_LINEUPS': True,
+}
 
 # Métricas externas por días de descanso que se consideran útiles para el modelo.
 # Formato: columna_origen -> (función_agg, nombre_feature_destino)
@@ -37,6 +47,7 @@ REST_METRIC_RULES: Dict[str, Tuple[str, str]] = {
 
 __all__ = [
     'DEFAULT_DAYS_REST',
+    'DEFAULT_LINEUP_CONFIG',
     'ensure_teamid_and_date',
     'features_roll10',
     'parse_days_rest_value',
@@ -47,6 +58,12 @@ __all__ = [
     'features_venue',
     'build_match_dataset_enhanced',
     'fit_and_eval',
+    'prep_dates',
+    'build_player_to_date_in_memory',
+    'compute_on_off_to_date_in_memory',
+    'estimate_expected_minutes',
+    'compute_lineup_metrics_for_row',
+    'add_lineup_features_in_memory',
 ]
 
 
@@ -856,3 +873,396 @@ def fit_and_eval(
         'metrics': metrics_dict,
         'model_name': model_name,
     }
+
+
+# =========================
+# LINEUP utilities (in-memory, anti-leakage)
+# =========================
+def prep_dates(df: Optional[pd.DataFrame], date_col: str) -> Optional[pd.DataFrame]:
+    """Return a copy of ``df`` with ``date_col`` cast to naive datetime64[ns]."""
+
+    if df is None:
+        return None
+
+    d = df.copy()
+    if date_col not in d.columns:
+        logger.warning("No se encontró la columna %s para normalizar fechas.", date_col)
+        return d
+
+    d[date_col] = pd.to_datetime(d[date_col], errors='coerce')
+    if ptypes.is_datetime64tz_dtype(d[date_col].dtype):
+        d[date_col] = d[date_col].dt.tz_convert(None)
+    try:
+        d[date_col] = d[date_col].dt.tz_localize(None)
+    except (TypeError, AttributeError):
+        # La serie ya es naive o no soporta tz_localize
+        pass
+
+    return d
+
+
+def build_player_to_date_in_memory(
+    player_box: pd.DataFrame,
+    mean_cols: List[str],
+    roll_cols: List[str],
+    group_keys: Sequence[str] = ('PLAYER_ID',),
+    date_col: str = 'GAME_DATE',
+) -> pd.DataFrame:
+    """Compute expanding/rolling stats for players without leaking current game information."""
+
+    if player_box is None or player_box.empty:
+        logger.warning("build_player_to_date_in_memory recibió boxscores vacíos.")
+        return pd.DataFrame()
+
+    missing_required = [col for col in ('PLAYER_ID', 'TEAM_ID', 'GAME_ID') if col not in player_box.columns]
+    if missing_required:
+        raise ValueError(f"Boxscores incompletos, faltan columnas: {missing_required}")
+
+    if date_col not in player_box.columns:
+        raise ValueError(f"Boxscores sin columna de fecha '{date_col}'.")
+
+    df = prep_dates(player_box, date_col)
+
+    order_cols: List[str] = list(dict.fromkeys((*group_keys, 'TEAM_ID', date_col, 'GAME_ID')))
+    order_cols = [c for c in order_cols if c in df.columns]
+    df = df.sort_values(order_cols)
+
+    available_mean = [c for c in mean_cols if c in df.columns]
+    missing_mean = sorted(set(mean_cols) - set(available_mean))
+    if missing_mean:
+        logger.warning("Columnas mean no disponibles para historizar: %s", missing_mean)
+
+    available_roll = [c for c in roll_cols if c in df.columns]
+    missing_roll = sorted(set(roll_cols) - set(available_roll))
+    if missing_roll:
+        logger.warning("Columnas rolling no disponibles para historizar: %s", missing_roll)
+
+    group_cols = list(group_keys)
+    n_roll = int(DEFAULT_LINEUP_CONFIG.get('N_ROLL_MIN', 5))
+
+    grouped = df.groupby(group_cols, dropna=False, sort=False)
+    pieces: List[pd.DataFrame] = []
+    for _, g in grouped:
+        g = g.copy()
+        for col in available_mean:
+            g[f"{col}_to_date"] = g[col].expanding(min_periods=1).mean().shift(1)
+        for col in available_roll:
+            g[f"{col}_roll{n_roll}_prev"] = (
+                g[col].rolling(window=n_roll, min_periods=1).mean().shift(1)
+            )
+        pieces.append(g)
+
+    result = pd.concat(pieces, ignore_index=True) if pieces else pd.DataFrame(columns=df.columns)
+    return result
+
+
+def compute_on_off_to_date_in_memory(
+    on_df: Optional[pd.DataFrame],
+    off_df: Optional[pd.DataFrame],
+    date_col: str = 'GAME_DATE',
+) -> pd.DataFrame:
+    """Combine ON/OFF splits to obtain per-player historical net rating differentials."""
+
+    expected_cols = [
+        'PLAYER_ID',
+        'TEAM_ID',
+        'GAME_ID',
+        date_col,
+        'ON_NET_RATING_to_date',
+        'OFF_NET_RATING_to_date',
+        'NET_RATING_DIFF_to_date',
+    ]
+
+    if on_df is None or on_df.empty or off_df is None or off_df.empty:
+        logger.info("Sin datos ON/OFF: se devuelve DataFrame vacío con columnas esperadas.")
+        return pd.DataFrame(columns=expected_cols)
+
+    on = prep_dates(on_df, date_col)
+    off = prep_dates(off_df, date_col)
+
+    def _rating_column(df: pd.DataFrame) -> str:
+        for candidate in ('NET_RATING_to_date', 'NET_RATING'):
+            if candidate in df.columns:
+                return candidate
+        raise ValueError("Falta columna NET_RATING en splits ON/OFF")
+
+    on_rating_col = _rating_column(on)
+    off_rating_col = _rating_column(off)
+
+    on_hist = on[['PLAYER_ID', 'TEAM_ID', 'GAME_ID', date_col, on_rating_col]].rename(
+        columns={on_rating_col: 'ON_NET_RATING_to_date'}
+    )
+    off_hist = off[['PLAYER_ID', 'TEAM_ID', 'GAME_ID', date_col, off_rating_col]].rename(
+        columns={off_rating_col: 'OFF_NET_RATING_to_date'}
+    )
+
+    merged = pd.merge(
+        on_hist,
+        off_hist,
+        on=['PLAYER_ID', 'TEAM_ID', 'GAME_ID', date_col],
+        how='outer',
+        suffixes=('_on', '_off'),
+    )
+    merged['NET_RATING_DIFF_to_date'] = merged['ON_NET_RATING_to_date'] - merged['OFF_NET_RATING_to_date']
+
+    return merged[expected_cols]
+
+
+def estimate_expected_minutes(player_hist: pd.DataFrame, n_roll: int = 5) -> pd.Series:
+    """Estimate expected minutes for players using rolling history with sensible fallbacks."""
+
+    if player_hist.empty:
+        return pd.Series(dtype=float)
+
+    col_roll = f"MIN_roll{n_roll}_prev"
+    if col_roll in player_hist.columns:
+        minutes = player_hist[col_roll].astype(float)
+    elif 'MIN_to_date' in player_hist.columns:
+        minutes = player_hist['MIN_to_date'].astype(float)
+    elif 'MIN' in player_hist.columns:
+        minutes = player_hist['MIN'].astype(float)
+    else:
+        minutes = pd.Series(np.nan, index=player_hist.index, dtype=float)
+        logger.warning("No se encontraron columnas MIN históricas; se usará fallback global.")
+
+    if minutes.isna().all():
+        minutes = pd.Series(15.0, index=player_hist.index, dtype=float)
+        return minutes
+
+    team_median = minutes.median(skipna=True)
+    if not np.isfinite(team_median):
+        team_median = 15.0
+
+    minutes = minutes.fillna(team_median).clip(lower=0)
+    if (minutes == 0).all():
+        minutes = pd.Series(15.0, index=player_hist.index, dtype=float)
+    return minutes
+
+
+def compute_lineup_metrics_for_row(
+    row: pd.Series,
+    player_hist: pd.DataFrame,
+    onoff_hist: pd.DataFrame,
+    lineups_df: Optional[pd.DataFrame],
+    config: Dict[str, object],
+) -> Dict[str, object]:
+    """Compute lineup-centric features for a single team-game row."""
+
+    defaults = {
+        'LINEUP_NUM_PLAYERS': 0,
+        'LINEUP_EXP_MIN_SUM': 0.0,
+        'LINEUP_NET_RATING_AVG': np.nan,
+        'LINEUP_IMPACT_AVG': np.nan,
+        'LINEUP_TS_PCT_AVG': np.nan,
+        'LINEUP_SCORE': 0.5,
+        'LINEUP_STARTERS_OUT': 0,
+        'LINEUP_B2B_FLAG': int(row.get('B2B_GAMES', 0) or 0),
+    }
+
+    team_id = row.get('TEAM_ID')
+    game_id = row.get('GAME_ID')
+    if pd.isna(team_id) or pd.isna(game_id):
+        logger.warning("Fila sin TEAM_ID o GAME_ID, se devuelven valores por defecto.")
+        return defaults
+
+    mask = (player_hist['TEAM_ID'] == team_id) & (player_hist['GAME_ID'] == game_id)
+    players = player_hist.loc[mask].copy()
+    if players.empty:
+        logger.warning(
+            "Sin boxscores históricos para TEAM_ID=%s GAME_ID=%s; valores por defecto.",
+            team_id,
+            game_id,
+        )
+        return defaults
+
+    n_roll = int(config.get('N_ROLL_MIN', DEFAULT_LINEUP_CONFIG['N_ROLL_MIN']))
+    exp_minutes = estimate_expected_minutes(players, n_roll=n_roll)
+    players['MIN_exp'] = exp_minutes
+
+    def _get_series(df: pd.DataFrame, col: str, default: float = 0.0) -> pd.Series:
+        if col in df.columns:
+            return df[col].astype(float)
+        return pd.Series(default, index=df.index, dtype=float)
+
+    pts = _get_series(players, 'PTS_to_date')
+    reb = _get_series(players, 'REB_to_date')
+    ast = _get_series(players, 'AST_to_date')
+    stl = _get_series(players, 'STL_to_date')
+    blk = _get_series(players, 'BLK_to_date')
+    tov = _get_series(players, 'TOV_to_date')
+    if tov.eq(0).all() and 'TO_to_date' in players.columns:
+        tov = players['TO_to_date'].astype(float)
+
+    min_to_date = _get_series(players, 'MIN_to_date', default=1.0).replace(0, 1.0)
+    impact = (pts + reb + ast + stl + blk - tov) / np.maximum(min_to_date, 1.0)
+    players['IMPACT_to_date'] = impact.replace([np.inf, -np.inf], np.nan)
+
+    if not onoff_hist.empty and config.get('USE_ON_OFF', True):
+        merge_keys = ['PLAYER_ID', 'TEAM_ID']
+        if 'GAME_ID' in onoff_hist.columns:
+            merge_keys.append('GAME_ID')
+        players = players.merge(onoff_hist, on=merge_keys, how='left')
+
+    net_rating = players.get('NET_RATING_to_date')
+    if net_rating is None or net_rating.isna().all():
+        net_rating = players['IMPACT_to_date']
+        players['NET_RATING_to_date'] = net_rating
+
+    weights = players['MIN_exp'].astype(float)
+    weight_sum = float(weights.sum()) if not weights.empty else 0.0
+
+    def _weighted_average(values: pd.Series) -> float:
+        if values is None or values.empty:
+            return np.nan
+        if weight_sum > 0:
+            return float(np.nansum(values * weights) / weight_sum)
+        if values.notna().any():
+            return float(values.mean())
+        return np.nan
+
+    lineup_net = _weighted_average(net_rating)
+    lineup_impact = _weighted_average(players['IMPACT_to_date'])
+    ts_series = players.get('TS_PCT_to_date')
+    lineup_ts = _weighted_average(ts_series) if ts_series is not None else np.nan
+
+    score = lineup_net
+    if not np.isfinite(score):
+        score = lineup_impact
+    if not np.isfinite(score):
+        score = 0.0
+    lineup_score = float(np.clip((score + 20.0) / 40.0, 0.0, 1.0))
+
+    starters_out = 0
+    if (
+        lineups_df is not None
+        and config.get('USE_LINEUPS', True)
+        and not lineups_df.empty
+        and {'TEAM_ID', 'GAME_ID'}.issubset(lineups_df.columns)
+    ):
+        subset = lineups_df[
+            (lineups_df['TEAM_ID'] == team_id) & (lineups_df['GAME_ID'] == game_id)
+        ]
+        if not subset.empty:
+            starters: set = set()
+            if 'PLAYER_ID' in subset.columns:
+                if 'IS_STARTER' in subset.columns:
+                    starters = set(
+                        subset.loc[subset['IS_STARTER'].astype(bool), 'PLAYER_ID'].dropna().astype(int)
+                    )
+                elif 'STARTER' in subset.columns:
+                    starters = set(
+                        subset.loc[subset['STARTER'].astype(bool), 'PLAYER_ID'].dropna().astype(int)
+                    )
+                else:
+                    starters = set(subset['PLAYER_ID'].dropna().astype(int))
+            elif 'STARTERS' in subset.columns:
+                starters_text = subset['STARTERS'].dropna().astype(str).tolist()
+                starters = {
+                    int(s.strip())
+                    for text in starters_text
+                    for s in re.split(r"[,;\s]+", text)
+                    if s.strip().isdigit()
+                }
+
+            active_players = set(players['PLAYER_ID'].dropna().astype(int))
+            starters_out = len(starters - active_players)
+
+    defaults.update(
+        {
+            'LINEUP_NUM_PLAYERS': int(players['PLAYER_ID'].nunique()),
+            'LINEUP_EXP_MIN_SUM': float(weight_sum),
+            'LINEUP_NET_RATING_AVG': float(lineup_net) if np.isfinite(lineup_net) else np.nan,
+            'LINEUP_IMPACT_AVG': float(lineup_impact) if np.isfinite(lineup_impact) else np.nan,
+            'LINEUP_TS_PCT_AVG': float(lineup_ts) if np.isfinite(lineup_ts) else np.nan,
+            'LINEUP_SCORE': lineup_score,
+            'LINEUP_STARTERS_OUT': int(starters_out) if starters_out else 0,
+        }
+    )
+
+    return defaults
+
+
+def add_lineup_features_in_memory(
+    df_teamgames: pd.DataFrame,
+    df_player_box: pd.DataFrame,
+    df_on: Optional[pd.DataFrame],
+    df_off: Optional[pd.DataFrame],
+    df_lineups: Optional[pd.DataFrame],
+    config: Dict[str, object] = DEFAULT_LINEUP_CONFIG,
+) -> pd.DataFrame:
+    """Augment team game logs with lineup-derived features computed in-memory."""
+
+    if df_teamgames is None or df_teamgames.empty:
+        raise ValueError("Se requieren teamgamelogs con información de partidos.")
+
+    if df_player_box is None or df_player_box.empty:
+        raise ValueError("Se requieren boxscores de jugadores para construir historiales.")
+
+    if not {'TEAM_ID', 'GAME_ID'}.issubset(df_teamgames.columns):
+        raise ValueError("teamgamelogs sin columnas TEAM_ID/GAME_ID, no se pueden generar features.")
+
+    if not {'TEAM_ID', 'GAME_ID', 'PLAYER_ID'}.issubset(df_player_box.columns):
+        raise ValueError("boxscores sin columnas clave TEAM_ID/GAME_ID/PLAYER_ID.")
+
+    effective_config = {**DEFAULT_LINEUP_CONFIG, **(config or {})}
+
+    df_team = prep_dates(df_teamgames.copy(), 'GAME_DATE')
+
+    if 'GAME_DATE' not in df_player_box.columns:
+        date_map = (
+            df_team[['TEAM_ID', 'GAME_ID', 'GAME_DATE']]
+            .drop_duplicates()
+            .rename(columns={'GAME_DATE': 'GAME_DATE'})
+        )
+        df_player_box = df_player_box.merge(date_map, on=['TEAM_ID', 'GAME_ID'], how='left')
+        missing_dates = df_player_box['GAME_DATE'].isna().sum()
+        if missing_dates > 0:
+            logger.warning("%s boxscores sin GAME_DATE tras merge; se imputarán como NaT.", missing_dates)
+    df_players = prep_dates(df_player_box, 'GAME_DATE')
+
+    df_on = prep_dates(df_on, 'GAME_DATE') if df_on is not None else None
+    df_off = prep_dates(df_off, 'GAME_DATE') if df_off is not None else None
+    df_lineups = prep_dates(df_lineups, 'GAME_DATE') if df_lineups is not None else None
+
+    mean_cols = [c for c in ['PTS', 'REB', 'AST', 'STL', 'BLK', 'TOV', 'MIN', 'NET_RATING', 'TS_PCT', 'USG_PCT'] if c in df_players.columns]
+    roll_cols = [c for c in ['MIN', 'PTS', 'AST', 'REB'] if c in df_players.columns]
+
+    player_hist = build_player_to_date_in_memory(
+        df_players,
+        mean_cols=mean_cols,
+        roll_cols=roll_cols,
+        group_keys=('PLAYER_ID',),
+        date_col='GAME_DATE',
+    )
+
+    onoff_hist = compute_on_off_to_date_in_memory(df_on, df_off, date_col='GAME_DATE')
+
+    results = []
+    for _, row in df_team.iterrows():
+        metrics = compute_lineup_metrics_for_row(row, player_hist, onoff_hist, df_lineups, effective_config)
+        results.append(metrics)
+
+    lineup_df = pd.DataFrame(results, index=df_team.index)
+    df_aug = df_team.copy()
+    for col in lineup_df.columns:
+        df_aug[col] = lineup_df[col]
+
+    lineup_cols = [c for c in df_aug.columns if c.startswith('LINEUP_')]
+    lower_pct, upper_pct = effective_config.get('TEAM_PCTL', (5, 95))
+
+    def _normalize_group(series: pd.Series) -> pd.Series:
+        valid = series.dropna()
+        if valid.empty:
+            return series
+        lower = np.nanpercentile(valid, lower_pct) if np.isfinite(lower_pct) else valid.min()
+        upper = np.nanpercentile(valid, upper_pct) if np.isfinite(upper_pct) else valid.max()
+        if not np.isfinite(upper) or not np.isfinite(lower) or upper == lower:
+            return series
+        scaled = (series - lower) / (upper - lower)
+        return scaled.clip(0.0, 1.0)
+
+    for col in lineup_cols:
+        norm_col = f"{col}_PCTL"
+        df_aug[norm_col] = df_aug.groupby('TEAM_ID')[col].transform(_normalize_group)
+
+    return df_aug
