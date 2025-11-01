@@ -4,9 +4,10 @@ Versión con MERGE SEGURO para Days Rest usando clave string '_REST_KEY' = TEAM_
 
 from __future__ import annotations
 
+import logging
 import re
 from pathlib import Path
-from typing import Dict, List, Optional, Sequence, Tuple
+from typing import Dict, Iterable, List, Optional, Sequence, Tuple
 
 import numpy as np
 import pandas as pd
@@ -24,6 +25,17 @@ from sklearn.metrics import (
 )
 from xgboost import XGBClassifier
 
+
+logger = logging.getLogger(__name__)
+
+
+DEFAULT_LINEUP_CONFIG = {
+    'N_ROLL_MIN': 5,
+    'TEAM_PCTL': (5, 95),
+    'USE_ON_OFF': True,
+    'USE_LINEUPS': True,
+}
+
 DEFAULT_DAYS_REST = 5
 
 # Métricas externas por días de descanso que se consideran útiles para el modelo.
@@ -36,6 +48,7 @@ REST_METRIC_RULES: Dict[str, Tuple[str, str]] = {
 }
 
 __all__ = [
+    'DEFAULT_LINEUP_CONFIG',
     'DEFAULT_DAYS_REST',
     'ensure_teamid_and_date',
     'features_roll10',
@@ -47,6 +60,12 @@ __all__ = [
     'features_venue',
     'build_match_dataset_enhanced',
     'fit_and_eval',
+    'prep_dates',
+    'build_player_to_date_in_memory',
+    'compute_on_off_to_date_in_memory',
+    'estimate_expected_minutes',
+    'compute_lineup_metrics_for_row',
+    'add_lineup_features_in_memory',
 ]
 
 
@@ -83,6 +102,528 @@ def _build_rest_key(df: pd.DataFrame, team_col='TEAM_ID', date_col='GAME_DATE', 
     date_str = pd.to_datetime(d[date_col], errors='coerce').dt.strftime('%Y-%m-%d')
     d[key] = team_str.fillna('NA') + '|' + date_str.fillna('NA')
     return d
+
+
+# =========================
+# LINEUP metrics utilities
+# =========================
+def prep_dates(df: pd.DataFrame, date_col: str) -> pd.DataFrame:
+    """Normaliza una columna de fechas a datetime64[ns] naive sin modificar el DF original."""
+
+    if date_col not in df.columns:
+        raise ValueError(f"La columna {date_col} no está presente en el DataFrame.")
+
+    d = df.copy()
+    d[date_col] = pd.to_datetime(d[date_col], errors='coerce')
+    if ptypes.is_datetime64tz_dtype(d[date_col]):
+        d[date_col] = d[date_col].dt.tz_localize(None)
+    d[date_col] = d[date_col].astype('datetime64[ns]')
+    return d
+
+
+def build_player_to_date_in_memory(
+    player_box: pd.DataFrame,
+    mean_cols: Sequence[str],
+    roll_cols: Sequence[str],
+    group_keys: Iterable[str] = ('PLAYER_ID',),
+    date_col: str = 'GAME_DATE',
+) -> pd.DataFrame:
+    """Calcula medias y rolling previos por jugador sin leakage (shift + fecha)."""
+
+    if not group_keys:
+        raise ValueError('group_keys no puede estar vacío.')
+
+    d = prep_dates(player_box, date_col)
+    group_keys = list(group_keys)
+
+    for key in group_keys:
+        if key not in d.columns:
+            raise ValueError(f"Falta la columna requerida {key} en player_box.")
+        if 'ID' in key.upper():
+            d[key] = pd.to_numeric(d[key], errors='coerce').astype('Int64')
+
+    if 'TEAM_ID' in d.columns:
+        d['TEAM_ID'] = pd.to_numeric(d['TEAM_ID'], errors='coerce').astype('Int64')
+    if 'GAME_ID' in d.columns:
+        d['GAME_ID'] = pd.to_numeric(d['GAME_ID'], errors='coerce').astype('Int64')
+
+    sort_cols: List[str] = [c for c in group_keys if c in d.columns]
+    if date_col in d.columns:
+        sort_cols.append(date_col)
+    if 'GAME_ID' in d.columns and 'GAME_ID' not in sort_cols:
+        sort_cols.append('GAME_ID')
+    d = d.sort_values(sort_cols)
+
+    group_obj = d.groupby(group_keys, sort=False)
+    n_roll = int(DEFAULT_LINEUP_CONFIG.get('N_ROLL_MIN', 5))
+
+    def _align_index(series: pd.Series) -> pd.Series:
+        if isinstance(series.index, pd.MultiIndex):
+            return series.droplevel(list(range(len(group_keys))))
+        return series
+
+    for col in mean_cols:
+        if col not in d.columns:
+            continue
+        mean_series = group_obj[col].apply(
+            lambda s: s.expanding(min_periods=1).mean().shift(1)
+        )
+        mean_series = _align_index(mean_series)
+        d[f'{col}_to_date'] = mean_series
+
+    for col in roll_cols:
+        if col not in d.columns:
+            continue
+        roll_series = group_obj[col].apply(
+            lambda s: s.shift(1).rolling(window=n_roll, min_periods=1).mean()
+        )
+        roll_series = _align_index(roll_series)
+        d[f'{col}_roll{n_roll}_prev'] = roll_series
+
+    return d
+
+
+def compute_on_off_to_date_in_memory(
+    on_df: Optional[pd.DataFrame],
+    off_df: Optional[pd.DataFrame],
+    date_col: str = 'GAME_DATE',
+) -> pd.DataFrame:
+    """Construye métricas on/off acumuladas por jugador hasta la fecha (sin leakage)."""
+
+    if on_df is None or off_df is None or on_df.empty or off_df.empty:
+        logger.warning('Datos on/off ausentes; se omiten métricas de ajuste de lineup.')
+        return pd.DataFrame()
+
+    if date_col not in on_df.columns or date_col not in off_df.columns:
+        logger.warning(
+            'Los DataFrames on/off no contienen %s; se omiten métricas on/off.',
+            date_col,
+        )
+        return pd.DataFrame()
+
+    for frame_name, frame in (('on', on_df), ('off', off_df)):
+        if 'PLAYER_ID' not in frame.columns:
+            logger.warning('El DataFrame %s carece de PLAYER_ID; se omite on/off.', frame_name)
+            return pd.DataFrame()
+
+    def _resolve_net_col(df: pd.DataFrame, label: str) -> Optional[str]:
+        for cand in ('NET_RATING', 'NET', 'NET_RTG', 'NET_ON', 'NET_OFF'):
+            if cand in df.columns:
+                return cand
+        logger.warning('No se encontró columna NET en dataset %s.', label)
+        return None
+
+    net_on_col = _resolve_net_col(on_df, 'on')
+    net_off_col = _resolve_net_col(off_df, 'off')
+    if net_on_col is None or net_off_col is None:
+        return pd.DataFrame()
+
+    on = prep_dates(on_df, date_col)
+    off = prep_dates(off_df, date_col)
+
+    def _aggregate(df: pd.DataFrame, value_col: str, suffix: str) -> pd.DataFrame:
+        keys = ['PLAYER_ID']
+        for extra in ('TEAM_ID', 'GAME_ID'):
+            if extra in df.columns:
+                keys.append(extra)
+        if date_col in df.columns:
+            keys.append(date_col)
+        keys = [k for k in keys if k in df.columns]
+        agg = (
+            df.sort_values(keys)
+            .groupby(keys, as_index=False)[value_col]
+            .mean()
+        )
+        agg['__cum'] = agg.groupby('PLAYER_ID')[value_col].cumsum()
+        agg[f'NET_{suffix}_to_date'] = agg.groupby('PLAYER_ID')['__cum'].shift(1)
+        agg = agg.drop(columns='__cum')
+        return agg
+
+    agg_on = _aggregate(on, net_on_col, 'ON')
+    agg_off = _aggregate(off, net_off_col, 'OFF')
+
+    merge_keys = ['PLAYER_ID']
+    for extra in ('TEAM_ID', 'GAME_ID', date_col):
+        if extra in agg_on.columns and extra in agg_off.columns:
+            merge_keys.append(extra)
+
+    merged = pd.merge(agg_on, agg_off, on=merge_keys, how='outer')
+    merged['DELTA_NET_to_date'] = merged['NET_ON_to_date'] - merged['NET_OFF_to_date']
+
+    return merged
+
+
+def estimate_expected_minutes(player_hist: pd.DataFrame, n_roll: int = 5) -> pd.Series:
+    """Calcula minutos esperados por jugador usando rolling previo; imputa si falta histórico."""
+
+    roll_col = f'MIN_roll{n_roll}_prev'
+    candidate_cols = [roll_col] + [c for c in player_hist.columns if c.startswith('MIN_roll')]
+    base_col = next((c for c in candidate_cols if c in player_hist.columns), None)
+
+    if base_col is None and 'MIN_to_date' in player_hist.columns:
+        base_col = 'MIN_to_date'
+
+    if base_col is None:
+        minutes = pd.Series(np.nan, index=player_hist.index, dtype='float64', name='MIN_exp')
+        minutes.attrs['imputed_mask'] = np.ones(len(minutes), dtype=bool)
+        return minutes.fillna(15.0)
+
+    minutes = player_hist[base_col].astype('float64').copy()
+    missing_before = minutes.isna()
+
+    if missing_before.any() and 'TEAM_ID' in player_hist.columns:
+        team_medians = player_hist.groupby('TEAM_ID')[base_col].transform('median')
+        minutes = minutes.fillna(team_medians)
+
+    minutes = minutes.fillna(15.0)
+    minutes.name = 'MIN_exp'
+    minutes.attrs['imputed_mask'] = missing_before.values
+    return minutes
+
+
+def compute_lineup_metrics_for_row(
+    row: pd.Series,
+    player_hist: pd.DataFrame,
+    onoff_hist: Optional[pd.DataFrame],
+    lineups_df: Optional[pd.DataFrame],
+    config: Dict[str, object],
+) -> Dict[str, object]:
+    """Calcula métricas de lineup ponderadas por minutos esperados para un partido-equipo."""
+
+    team_id = row.get('TEAM_ID')
+    game_id = row.get('GAME_ID')
+    game_date = row.get('GAME_DATE')
+
+    if pd.isna(team_id) or pd.isna(game_id) or pd.isna(game_date):
+        return {
+            'LINEUP_EFF_RATING_RAW': np.nan,
+            'LINEUP_EFF_ADJ': np.nan,
+            'LINEUP_STARTERS_OUT': np.nan,
+            'LINEUP_BENCH_DEPTH': np.nan,
+            'LINEUP_MIN_VAR': np.nan,
+            'LINEUP_AVAIL_PENALTY': np.nan,
+            '__players_count': 0,
+            '__min_exp_imputed': 0,
+        }
+
+    n_roll = int(config.get('N_ROLL_MIN', DEFAULT_LINEUP_CONFIG['N_ROLL_MIN']))
+
+    team_series = player_hist['TEAM_ID'] if 'TEAM_ID' in player_hist.columns else pd.Series(np.nan, index=player_hist.index)
+    game_series = player_hist['GAME_ID'] if 'GAME_ID' in player_hist.columns else pd.Series(np.nan, index=player_hist.index)
+    date_series = (
+        player_hist['GAME_DATE']
+        if 'GAME_DATE' in player_hist.columns
+        else pd.Series(pd.NaT, index=player_hist.index, dtype='datetime64[ns]')
+    )
+
+    mask_current = (team_series == team_id) & (game_series == game_id)
+    players_current = player_hist.loc[mask_current].copy()
+
+    if players_current.empty:
+        team_mask = team_series == team_id
+        prior_mask = team_mask & (date_series < game_date)
+        recent = player_hist.loc[prior_mask].sort_values('GAME_DATE')
+        if not recent.empty:
+            if 'MIN' in recent.columns:
+                tail = recent.groupby('PLAYER_ID').tail(n_roll)
+                top_players = (
+                    tail.groupby('PLAYER_ID')['MIN']
+                    .mean()
+                    .sort_values(ascending=False)
+                    .head(9)
+                    .index
+                )
+                players_current = (
+                    recent[recent['PLAYER_ID'].isin(top_players)]
+                    .sort_values('GAME_DATE')
+                    .groupby('PLAYER_ID')
+                    .tail(1)
+                )
+
+    if players_current.empty:
+        return {
+            'LINEUP_EFF_RATING_RAW': np.nan,
+            'LINEUP_EFF_ADJ': np.nan,
+            'LINEUP_STARTERS_OUT': np.nan,
+            'LINEUP_BENCH_DEPTH': np.nan,
+            'LINEUP_MIN_VAR': np.nan,
+            'LINEUP_AVAIL_PENALTY': np.nan,
+            '__players_count': 0,
+            '__min_exp_imputed': 0,
+        }
+
+    minutes = estimate_expected_minutes(players_current, n_roll=n_roll)
+    players_current = players_current.assign(MIN_exp=minutes.values)
+    imputed_mask = minutes.attrs.get('imputed_mask')
+    imputed_count = int(imputed_mask.sum()) if imputed_mask is not None else 0
+
+    if onoff_hist is not None and not onoff_hist.empty:
+        candidates = onoff_hist[onoff_hist['PLAYER_ID'].isin(players_current['PLAYER_ID'])]
+        if 'TEAM_ID' in candidates.columns:
+            candidates = candidates[(candidates['TEAM_ID'].isna()) | (candidates['TEAM_ID'] == team_id)]
+        if 'GAME_DATE' in candidates.columns:
+            candidates = candidates[candidates['GAME_DATE'] <= game_date]
+        onoff_snapshot = (
+            candidates.sort_values('GAME_DATE')
+            .groupby('PLAYER_ID')
+            .tail(1)
+        )
+        if not onoff_snapshot.empty:
+            players_current = players_current.merge(
+                onoff_snapshot[['PLAYER_ID', 'NET_ON_to_date', 'NET_OFF_to_date', 'DELTA_NET_to_date']],
+                on='PLAYER_ID',
+                how='left',
+            )
+
+    metric_col = 'NET_RATING_to_date'
+    if metric_col not in players_current.columns or players_current[metric_col].isna().all():
+        needed = ['PTS_to_date', 'REB_to_date', 'AST_to_date', 'STL_to_date', 'BLK_to_date', 'TOV_to_date', 'MIN_to_date']
+        if all(col in players_current.columns for col in needed):
+            impact = (
+                players_current['PTS_to_date']
+                + players_current['REB_to_date']
+                + players_current['AST_to_date']
+                + players_current['STL_to_date']
+                + players_current['BLK_to_date']
+                - players_current['TOV_to_date']
+            ) / players_current['MIN_to_date'].clip(lower=1.0)
+            players_current['IMPACT_to_date'] = impact
+            metric_col = 'IMPACT_to_date'
+
+    eff_values = players_current.get(metric_col)
+    weights = players_current['MIN_exp']
+    valid_mask = eff_values.notna() & weights.notna() & (weights > 0)
+
+    if valid_mask.any():
+        lineup_eff_rating = np.average(eff_values[valid_mask], weights=weights[valid_mask])
+    else:
+        lineup_eff_rating = np.nan
+
+    if 'DELTA_NET_to_date' in players_current.columns:
+        adj_values = players_current['DELTA_NET_to_date']
+        valid_adj = adj_values.notna() & weights.notna() & (weights > 0)
+        if valid_adj.any():
+            lineup_eff_adj = np.average(adj_values[valid_adj], weights=weights[valid_adj])
+        else:
+            lineup_eff_adj = np.nan
+    else:
+        lineup_eff_adj = np.nan
+
+    starters_out = np.nan
+    bench_depth = np.nan
+    starters_set = set()
+
+    if config.get('USE_LINEUPS', True) and lineups_df is not None and not lineups_df.empty:
+        lineup_team = lineups_df[lineups_df['TEAM_ID'] == team_id]
+        if not lineup_team.empty and 'PLAYER_ID' in lineup_team.columns and 'MIN' in lineup_team.columns:
+            prior_lineups = lineup_team[lineup_team['GAME_DATE'] < game_date]
+            if not prior_lineups.empty:
+                top_minutes = (
+                    prior_lineups.groupby('PLAYER_ID')['MIN']
+                    .sum()
+                    .sort_values(ascending=False)
+                    .head(5)
+                )
+                starters_set = set(top_minutes.index)
+                active_set = set(players_current['PLAYER_ID'])
+                starters_out = float(len(starters_set - active_set))
+    if not starters_set:
+        starters_set = set(
+            players_current.sort_values('MIN_exp', ascending=False)
+            .head(5)['PLAYER_ID']
+        )
+        starters_out = 0.0
+
+    bench_players = [pid for pid in players_current['PLAYER_ID'] if pid not in starters_set]
+    if bench_players:
+        bench_minutes = players_current.set_index('PLAYER_ID').loc[bench_players, 'MIN_exp']
+        bench_depth = float((bench_minutes >= 15).sum())
+    else:
+        bench_depth = 0.0
+
+    top_minutes = (
+        players_current.sort_values('MIN_exp', ascending=False)
+        .head(9)['MIN_exp']
+        .astype(float)
+    )
+    lineup_min_var = float(np.nanvar(top_minutes, ddof=0)) if not top_minutes.empty else np.nan
+
+    b2b_keys = ['B2B_GAMES', 'IS_BACK_TO_BACK', 'BACK_TO_BACK']
+    b2b_games = 0.0
+    for key in b2b_keys:
+        value = row.get(key)
+        if value not in (None, np.nan):
+            try:
+                b2b_games = float(value)
+                break
+            except Exception:  # noqa: BLE001
+                continue
+
+    availability_penalty = 0.15 * float(starters_out if not np.isnan(starters_out) else 0.0) + 0.05 * b2b_games
+
+    return {
+        'LINEUP_EFF_RATING_RAW': float(lineup_eff_rating) if lineup_eff_rating == lineup_eff_rating else np.nan,
+        'LINEUP_EFF_ADJ': float(lineup_eff_adj) if lineup_eff_adj == lineup_eff_adj else np.nan,
+        'LINEUP_STARTERS_OUT': float(starters_out) if starters_out == starters_out else np.nan,
+        'LINEUP_BENCH_DEPTH': float(bench_depth) if bench_depth == bench_depth else np.nan,
+        'LINEUP_MIN_VAR': lineup_min_var,
+        'LINEUP_AVAIL_PENALTY': availability_penalty,
+        '__players_count': int(len(players_current)),
+        '__min_exp_imputed': int(imputed_count),
+    }
+
+
+def add_lineup_features_in_memory(
+    df_teamgames: pd.DataFrame,
+    df_player_box: pd.DataFrame,
+    df_on: Optional[pd.DataFrame],
+    df_off: Optional[pd.DataFrame],
+    df_lineups: Optional[pd.DataFrame],
+    config: Dict[str, object] = DEFAULT_LINEUP_CONFIG,
+) -> pd.DataFrame:
+    """Enriquece un dataframe de partidos-equipo con métricas de lineup sin tocar disco."""
+
+    cfg = {**DEFAULT_LINEUP_CONFIG, **(config or {})}
+
+    team_df = df_teamgames.copy()
+    if 'GAME_DATE' in team_df.columns:
+        team_df = prep_dates(team_df, 'GAME_DATE')
+    for col in ('TEAM_ID', 'GAME_ID'):
+        if col in team_df.columns:
+            team_df[col] = pd.to_numeric(team_df[col], errors='coerce').astype('Int64')
+
+    player_df = df_player_box.copy()
+    if 'GAME_DATE' in player_df.columns:
+        player_df = prep_dates(player_df, 'GAME_DATE')
+    for col in ('PLAYER_ID', 'TEAM_ID', 'GAME_ID'):
+        if col in player_df.columns:
+            player_df[col] = pd.to_numeric(player_df[col], errors='coerce').astype('Int64')
+
+    mean_cols_default = [
+        'PTS',
+        'REB',
+        'AST',
+        'STL',
+        'BLK',
+        'TOV',
+        'MIN',
+        'OFF_RATING',
+        'DEF_RATING',
+        'NET_RATING',
+        'TS_PCT',
+        'USG_PCT',
+    ]
+    mean_cols = [c for c in mean_cols_default if c in player_df.columns]
+    roll_cols_default = ['MIN', 'PTS', 'AST', 'REB']
+    roll_cols = [c for c in roll_cols_default if c in player_df.columns]
+
+    player_hist = build_player_to_date_in_memory(
+        player_df,
+        mean_cols=mean_cols,
+        roll_cols=roll_cols,
+        group_keys=('PLAYER_ID',),
+        date_col='GAME_DATE',
+    )
+
+    onoff_hist = None
+    if cfg.get('USE_ON_OFF', True):
+        onoff_hist = compute_on_off_to_date_in_memory(df_on, df_off, date_col='GAME_DATE')
+        if onoff_hist.empty:
+            onoff_hist = None
+
+    lineups_hist = None
+    if cfg.get('USE_LINEUPS', True) and df_lineups is not None and not df_lineups.empty:
+        if 'GAME_DATE' in df_lineups.columns:
+            lineups_hist = prep_dates(df_lineups.copy(), 'GAME_DATE')
+        else:
+            logger.warning('El dataframe de lineups no contiene GAME_DATE; se omite STARTERS_OUT.')
+            lineups_hist = None
+
+    team_df = team_df.sort_values(['TEAM_ID', 'GAME_DATE'])
+
+    lineup_rows: List[Dict[str, object]] = []
+    for _, row in team_df.iterrows():
+        metrics = compute_lineup_metrics_for_row(row, player_hist, onoff_hist, lineups_hist, cfg)
+        metrics.update(
+            {
+                'TEAM_ID': row.get('TEAM_ID'),
+                'GAME_ID': row.get('GAME_ID'),
+                'GAME_DATE': row.get('GAME_DATE'),
+            }
+        )
+        lineup_rows.append(metrics)
+
+    lineup_df = pd.DataFrame(lineup_rows)
+    if lineup_df.empty:
+        logger.warning('No fue posible calcular métricas de lineup; se devuelve dataframe original.')
+        return team_df
+
+    low_pct, high_pct = cfg.get('TEAM_PCTL', DEFAULT_LINEUP_CONFIG['TEAM_PCTL'])
+
+    lineup_df = lineup_df.sort_values(['TEAM_ID', 'GAME_DATE']).reset_index(drop=True)
+
+    norm_series = pd.Series(np.nan, index=lineup_df.index, dtype='float64')
+    for team_id, group in lineup_df.groupby('TEAM_ID', sort=False):
+        history: List[float] = []
+        for idx in group.index:
+            raw_value = lineup_df.at[idx, 'LINEUP_EFF_RATING_RAW']
+            valid_history = [v for v in history if v == v]
+            if not valid_history:
+                normalized = 0.5 if raw_value == raw_value else np.nan
+            else:
+                low_val = np.nanpercentile(valid_history, low_pct)
+                high_val = np.nanpercentile(valid_history, high_pct)
+                if not np.isfinite(low_val) or not np.isfinite(high_val) or np.isclose(high_val, low_val):
+                    normalized = 0.5 if raw_value == raw_value else np.nan
+                elif raw_value == raw_value:
+                    normalized = np.clip((raw_value - low_val) / (high_val - low_val), 0.0, 1.0)
+                else:
+                    normalized = np.nan
+            norm_series.at[idx] = normalized
+            history.append(raw_value)
+
+    lineup_df['LINEUP_EFF_RATING'] = norm_series
+    lineup_df['LINEUP_EFF_RATING'] = lineup_df['LINEUP_EFF_RATING'].fillna(0.5)
+
+    lineup_df['LINEUP_AVAIL_PENALTY'] = lineup_df['LINEUP_AVAIL_PENALTY'].fillna(0.0)
+    lineup_df['LINEUP_SCORE'] = np.clip(
+        lineup_df['LINEUP_EFF_RATING'] - lineup_df['LINEUP_AVAIL_PENALTY'],
+        0.0,
+        1.0,
+    )
+
+    enriched = team_df.merge(
+        lineup_df.drop(columns=['__players_count', '__min_exp_imputed']),
+        on=['TEAM_ID', 'GAME_ID', 'GAME_DATE'],
+        how='left',
+    )
+
+    total_players = lineup_df['__players_count'].sum()
+    total_imputed = lineup_df['__min_exp_imputed'].sum()
+    imputed_pct = (total_imputed / total_players) if total_players else 0.0
+    logger.info(
+        'Métricas LINEUP calculadas para %d filas; imputación de MIN_exp en %.2f%% de los jugadores.',
+        len(lineup_df),
+        imputed_pct * 100,
+    )
+
+    lineup_cols = [
+        'LINEUP_SCORE',
+        'LINEUP_EFF_RATING',
+        'LINEUP_EFF_RATING_RAW',
+        'LINEUP_EFF_ADJ',
+        'LINEUP_STARTERS_OUT',
+        'LINEUP_BENCH_DEPTH',
+        'LINEUP_MIN_VAR',
+        'LINEUP_AVAIL_PENALTY',
+    ]
+    existing_cols = [c for c in lineup_cols if c in enriched.columns]
+    if existing_cols:
+        nan_ratio = enriched[existing_cols].isna().mean()
+        for col_name, ratio in nan_ratio.items():
+            logger.info('Porcentaje de NaN en %s: %.2f%%', col_name, ratio * 100)
+
+    return enriched
 
 
 # =========================
