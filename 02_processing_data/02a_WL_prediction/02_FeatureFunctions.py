@@ -775,7 +775,10 @@ def add_lineup_features_in_memory(
     for metric in metrics_to_normalize:
         lineup_df[f'{metric}_NORM'] = (
             lineup_sorted.groupby('TEAM_ID', group_keys=False)
-            .apply(lambda g, col=metric: _percentile_norm(g, col))
+            .apply(
+                lambda g, col=metric: _percentile_norm(g, col),
+                include_groups=False,
+            )
         )
 
     score = np.zeros(len(lineup_df))
@@ -801,6 +804,13 @@ def add_lineup_features_in_memory(
     ]
 
     result = df_teamgames.copy()
+
+    for key in ('TEAM_ID', 'GAME_ID'):
+        if key in lineup_df.columns:
+            lineup_df[key] = lineup_df[key].astype(str)
+        if key in result.columns:
+            result[key] = result[key].astype(str)
+
     result = result.merge(lineup_df[output_cols], on=['TEAM_ID', 'GAME_ID'], how='left')
     return result
 
@@ -1102,7 +1112,11 @@ def features_enhanced(df: pd.DataFrame, config: Dict[str, object]) -> pd.DataFra
         g['DAYS_REST_RANGE'] = g['DAYS_REST'].map(_format_range)
         return g
 
-    d = d.groupby(group_cols, group_keys=False).apply(process_group).reset_index(drop=True)
+    d = (
+        d.groupby(group_cols, group_keys=False)
+        .apply(process_group, include_groups=False)
+        .reset_index(drop=True)
+    )
 
     # === Refuerzo con parquet de descanso (opcional) usando MERGE SEGURO ===
     days_path = (config or {}).get('days_rest_path') if isinstance(config, dict) else None
