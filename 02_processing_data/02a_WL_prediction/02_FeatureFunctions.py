@@ -29,15 +29,14 @@ DEFAULT_DAYS_REST = 5
 DEFAULT_LINEUP_CONFIG = {
     'N_ROLL_MIN': 5,
     'TEAM_PCTL': (5, 95),
-    'USE_ON_OFF': True,
+    'USE_ON_OFF': False,
     'USE_LINEUPS': True,
     'MIN_EXP_FALLBACK': 15,
     'MIN_BENCH_THRESHOLD': 15,
     'LINEUP_WEIGHTS': {
-        'EFF_RATING': 0.4,
-        'EFF_ADJ': 0.3,
-        'BENCH_DEPTH': 0.15,
-        'AVAIL_PENALTY': 0.15,
+        'EFF_RATING': 0.55,
+        'BENCH_DEPTH': 0.25,
+        'AVAIL_PENALTY': 0.20,
     },
 }
 
@@ -322,57 +321,12 @@ def compute_on_off_to_date_in_memory(
     off_df: Optional[pd.DataFrame],
     team_games: pd.DataFrame,
 ) -> pd.DataFrame:
-    """Compute on/off expanding metrics shifted to avoid future leakage."""
+    """Safe placeholder: returns empty frame because on/off splits are season averages."""
 
-    if on_df is None or off_df is None:
-        return pd.DataFrame(columns=['PLAYER_ID', 'GAME_DATE', 'NET_ON_to_date', 'NET_OFF_to_date', 'DELTA_NET_to_date'])
-
-    if {'GAME_ID', 'PLAYER_ID', 'NET_RATING'}.difference(on_df.columns):
-        raise ValueError("El DataFrame on_df debe contener GAME_ID, PLAYER_ID y NET_RATING")
-    if {'GAME_ID', 'PLAYER_ID', 'NET_RATING'}.difference(off_df.columns):
-        raise ValueError("El DataFrame off_df debe contener GAME_ID, PLAYER_ID y NET_RATING")
-    if 'GAME_DATE' not in team_games.columns:
-        raise ValueError("team_games debe contener GAME_DATE")
-
-    team_dates = team_games[['GAME_ID', 'GAME_DATE']].drop_duplicates()
-    team_dates['GAME_DATE'] = pd.to_datetime(team_dates['GAME_DATE'], errors='coerce')
-
-    on = on_df[['PLAYER_ID', 'GAME_ID', 'NET_RATING']].copy()
-    on['NET_RATING'] = pd.to_numeric(on['NET_RATING'], errors='coerce')
-    on = on.merge(team_dates, on='GAME_ID', how='inner', validate='many_to_one')
-    on = (
-        on.groupby(['PLAYER_ID', 'GAME_DATE'], as_index=False)['NET_RATING']
-        .mean()
-        .rename(columns={'NET_RATING': 'NET_RATING_ON'})
+    print("⚠️  ON/OFF DESACTIVADO - Datos son promedios de temporada (no por juego)")
+    return pd.DataFrame(
+        columns=['PLAYER_ID', 'GAME_DATE', 'NET_ON_to_date', 'NET_OFF_to_date', 'DELTA_NET_to_date']
     )
-
-    off = off_df[['PLAYER_ID', 'GAME_ID', 'NET_RATING']].copy()
-    off['NET_RATING'] = pd.to_numeric(off['NET_RATING'], errors='coerce')
-    off = off.merge(team_dates, on='GAME_ID', how='inner', validate='many_to_one')
-    off = (
-        off.groupby(['PLAYER_ID', 'GAME_DATE'], as_index=False)['NET_RATING']
-        .mean()
-        .rename(columns={'NET_RATING': 'NET_RATING_OFF'})
-    )
-
-    merged = pd.merge(on, off, on=['PLAYER_ID', 'GAME_DATE'], how='outer')
-    merged['GAME_DATE'] = pd.to_datetime(merged['GAME_DATE'], errors='coerce')
-    merged = merged.sort_values(['PLAYER_ID', 'GAME_DATE']).reset_index(drop=True)
-
-    for col in ['NET_RATING_ON', 'NET_RATING_OFF']:
-        merged[col] = pd.to_numeric(merged[col], errors='coerce')
-
-    def _exp_shift(series: pd.Series) -> pd.Series:
-        return series.expanding().mean().shift(1)
-
-    grouped = merged.groupby('PLAYER_ID', group_keys=False)
-    merged['NET_ON_to_date'] = grouped['NET_RATING_ON'].transform(_exp_shift)
-    merged['NET_OFF_to_date'] = grouped['NET_RATING_OFF'].transform(_exp_shift)
-    merged['DELTA_NET_to_date'] = merged['NET_ON_to_date'] - merged['NET_OFF_to_date']
-
-    merged['PLAYER_ID'] = pd.to_numeric(merged['PLAYER_ID'], errors='coerce').astype('Int64')
-
-    return merged[['PLAYER_ID', 'GAME_DATE', 'NET_ON_to_date', 'NET_OFF_to_date', 'DELTA_NET_to_date']]
 
 
 def process_lineups_data(
@@ -458,7 +412,8 @@ def compute_lineup_metrics_for_game(
     players['GAME_DATE'] = pd.to_datetime(players['GAME_DATE'], errors='coerce')
     players['PLAYER_ID'] = pd.to_numeric(players['PLAYER_ID'], errors='coerce').astype('Int64')
 
-    if onoff_hist is not None and not onoff_hist.empty:
+    use_on_off = bool(cfg.get('USE_ON_OFF', False))
+    if use_on_off and onoff_hist is not None and not onoff_hist.empty:
         onoff_hist = onoff_hist.copy()
         onoff_hist['GAME_DATE'] = pd.to_datetime(onoff_hist['GAME_DATE'], errors='coerce')
         onoff_hist['PLAYER_ID'] = pd.to_numeric(onoff_hist['PLAYER_ID'], errors='coerce').astype('Int64')
@@ -509,7 +464,7 @@ def compute_lineup_metrics_for_game(
             eff_rating = float(np.average(proxy[mask_weights], weights=weight[mask_weights]))
 
     eff_adj = 0.0
-    if 'DELTA_NET_to_date' in players.columns:
+    if use_on_off and 'DELTA_NET_to_date' in players.columns:
         eff_adj_val = _weighted_average(players['DELTA_NET_to_date'])
         if not np.isnan(eff_adj_val):
             eff_adj = float(eff_adj_val)
