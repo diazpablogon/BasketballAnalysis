@@ -26,6 +26,20 @@ from xgboost import XGBClassifier
 
 DEFAULT_DAYS_REST = 5
 
+DEFAULT_LINEUP_CONFIG = {
+    'N_ROLL_MIN': 5,
+    'TEAM_PCTL': (5, 95),
+    'USE_ON_OFF': False,
+    'USE_LINEUPS': True,
+    'MIN_EXP_FALLBACK': 15,
+    'MIN_BENCH_THRESHOLD': 15,
+    'LINEUP_WEIGHTS': {
+        'EFF_RATING': 0.55,
+        'BENCH_DEPTH': 0.25,
+        'AVAIL_PENALTY': 0.20,
+    },
+}
+
 # Métricas externas por días de descanso que se consideran útiles para el modelo.
 # Formato: columna_origen -> (función_agg, nombre_feature_destino)
 REST_METRIC_RULES: Dict[str, Tuple[str, str]] = {
@@ -37,6 +51,7 @@ REST_METRIC_RULES: Dict[str, Tuple[str, str]] = {
 
 __all__ = [
     'DEFAULT_DAYS_REST',
+    'DEFAULT_LINEUP_CONFIG',
     'ensure_teamid_and_date',
     'features_roll10',
     'parse_days_rest_value',
@@ -47,6 +62,12 @@ __all__ = [
     'features_venue',
     'build_match_dataset_enhanced',
     'fit_and_eval',
+    'prep_dates',
+    'build_player_to_date_in_memory',
+    'compute_on_off_to_date_in_memory',
+    'process_lineups_data',
+    'compute_lineup_metrics_for_game',
+    'add_lineup_features_in_memory',
 ]
 
 
@@ -198,6 +219,600 @@ def _find_column_case_insensitive(columns: pd.Index, *aliases: str) -> str | Non
         if cand_lower in lower_map:
             return lower_map[cand_lower]
     return None
+
+
+# =========================
+# Lineup feature utilities
+# =========================
+def _resolve_lineup_config(config: Optional[Dict]) -> Dict:
+    cfg = DEFAULT_LINEUP_CONFIG.copy()
+    if config is None:
+        return cfg
+    for key, value in config.items():
+        if key == 'LINEUP_WEIGHTS':
+            weights = cfg['LINEUP_WEIGHTS'].copy()
+            if isinstance(value, dict):
+                weights.update(value)
+            cfg['LINEUP_WEIGHTS'] = weights
+        else:
+            cfg[key] = value
+    return cfg
+
+
+def prep_dates(df: pd.DataFrame, date_col: str) -> pd.DataFrame:
+    """Return a copy with normalized naive datetimes sorted ascending."""
+
+    if date_col not in df.columns:
+        raise KeyError(f"La columna de fecha '{date_col}' no existe en el DataFrame.")
+
+    result = df.copy()
+    dates = pd.to_datetime(result[date_col], errors='coerce')
+    if ptypes.is_datetime64tz_dtype(dates.dtype):
+        dates = dates.dt.tz_localize(None)
+    result[date_col] = dates
+    result = result.sort_values(date_col).reset_index(drop=True)
+    return result
+
+
+def build_player_to_date_in_memory(
+    player_box: pd.DataFrame,
+    team_games: pd.DataFrame,
+    mean_cols: Sequence[str],
+    roll_cols: Sequence[str],
+    config: Optional[Dict] = None,
+) -> pd.DataFrame:
+    """Build historical player metrics with strict temporal anti-leakage safeguards."""
+
+    cfg = _resolve_lineup_config(config)
+    required = {'GAME_ID', 'TEAM_ID', 'PLAYER_ID'}
+    missing = required - set(player_box.columns)
+    if missing:
+        raise ValueError(f"Faltan columnas requeridas en player_box: {sorted(missing)}")
+
+    if {'GAME_ID', 'TEAM_ID', 'GAME_DATE'}.difference(team_games.columns):
+        raise ValueError("team_games debe contener GAME_ID, TEAM_ID y GAME_DATE")
+
+    team_dates = team_games[['GAME_ID', 'TEAM_ID', 'GAME_DATE']].drop_duplicates()
+    team_dates['GAME_DATE'] = pd.to_datetime(team_dates['GAME_DATE'], errors='coerce')
+
+    base = player_box.copy()
+    for col in ['GAME_ID', 'TEAM_ID', 'PLAYER_ID']:
+        base[col] = pd.to_numeric(base[col], errors='coerce')
+
+    merged = base.merge(team_dates, on=['GAME_ID', 'TEAM_ID'], how='inner', validate='many_to_one')
+    merged['GAME_DATE'] = pd.to_datetime(merged['GAME_DATE'], errors='coerce')
+    merged['TEAM_ID'] = pd.to_numeric(merged['TEAM_ID'], errors='coerce').astype('Int64')
+    merged['PLAYER_ID'] = pd.to_numeric(merged['PLAYER_ID'], errors='coerce').astype('Int64')
+    merged['GAME_ID'] = pd.to_numeric(merged['GAME_ID'], errors='coerce').astype('Int64')
+    merged = merged.sort_values(['PLAYER_ID', 'GAME_DATE']).reset_index(drop=True)
+
+    # Prepare numeric conversions for computation
+    for col in set(mean_cols) | set(roll_cols):
+        if col not in merged.columns:
+            merged[col] = np.nan
+        else:
+            merged[col] = pd.to_numeric(merged[col], errors='coerce')
+
+    group_key = merged.groupby('PLAYER_ID', group_keys=False)
+
+    for col in mean_cols:
+        col_name = f"{col}_to_date"
+
+        def _mean_shift(series: pd.Series) -> pd.Series:
+            return series.expanding().mean().shift(1)
+
+        merged[col_name] = group_key[col].transform(_mean_shift)
+
+    window = int(cfg.get('N_ROLL_MIN', 5))
+    window = max(1, window)
+    for col in roll_cols:
+        col_name = f"{col}_roll{window}_prev"
+
+        def _roll_shift(series: pd.Series) -> pd.Series:
+            return series.rolling(window=window, min_periods=1).mean().shift(1)
+
+        merged[col_name] = group_key[col].transform(_roll_shift)
+
+    return merged
+
+
+def compute_on_off_to_date_in_memory(
+    on_df: Optional[pd.DataFrame],
+    off_df: Optional[pd.DataFrame],
+    team_games: pd.DataFrame,
+) -> pd.DataFrame:
+    """Compute rolling on/off metrics when per-game data is available.
+
+    The function inspects the structure of the provided DataFrames and only
+    computes historical averages when GAME_ID is present. If the supplied data
+    is aggregated at the season level (lacking GAME_ID), it returns an empty
+    DataFrame to avoid temporal leakage while signalling the condition.
+    """
+
+    empty = pd.DataFrame(
+        columns=['PLAYER_ID', 'GAME_DATE', 'NET_ON_to_date', 'NET_OFF_to_date', 'DELTA_NET_to_date']
+    )
+
+    if on_df is None or off_df is None:
+        return empty
+
+    if on_df.empty or off_df.empty:
+        return empty
+
+    has_game_id = 'GAME_ID' in on_df.columns and 'GAME_ID' in off_df.columns
+
+    if not has_game_id:
+        print(
+            "⚠️  ON/OFF DESACTIVADO - Datos agregados por temporada sin GAME_ID."
+            " Se omiten para prevenir leakage."
+        )
+        return empty
+
+    required_cols = {'PLAYER_ID', 'GAME_ID', 'NET_RATING'}
+
+    missing_on = required_cols - set(on_df.columns)
+    missing_off = required_cols - set(off_df.columns)
+    if missing_on:
+        raise ValueError(f"Faltan columnas en on_df: {sorted(missing_on)}")
+    if missing_off:
+        raise ValueError(f"Faltan columnas en off_df: {sorted(missing_off)}")
+
+    if {'GAME_ID', 'GAME_DATE'}.difference(team_games.columns):
+        raise ValueError("team_games debe contener GAME_ID y GAME_DATE para cruzar on/off")
+
+    team_dates = team_games[['GAME_ID', 'GAME_DATE']].drop_duplicates()
+    team_dates['GAME_DATE'] = pd.to_datetime(team_dates['GAME_DATE'], errors='coerce')
+
+    def _prep(df: pd.DataFrame, value_col: str, out_col: str) -> pd.DataFrame:
+        subset = df[['PLAYER_ID', 'GAME_ID', value_col]].copy()
+        subset['PLAYER_ID'] = pd.to_numeric(subset['PLAYER_ID'], errors='coerce').astype('Int64')
+        subset['GAME_ID'] = pd.to_numeric(subset['GAME_ID'], errors='coerce').astype('Int64')
+        subset[value_col] = pd.to_numeric(subset[value_col], errors='coerce')
+        subset = subset.merge(team_dates, on='GAME_ID', how='inner', validate='many_to_one')
+        subset = subset.dropna(subset=['PLAYER_ID', 'GAME_ID', 'GAME_DATE'])
+        subset = subset.sort_values(['PLAYER_ID', 'GAME_DATE']).reset_index(drop=True)
+        subset = subset.groupby(['PLAYER_ID', 'GAME_DATE'], as_index=False)[value_col].mean()
+        subset[out_col] = (
+            subset.groupby('PLAYER_ID')[value_col]
+            .expanding(min_periods=1)
+            .mean()
+            .shift(1)
+            .reset_index(level=0, drop=True)
+        )
+        subset = subset.drop(columns=[value_col])
+        return subset
+
+    on_hist = _prep(on_df, 'NET_RATING', 'NET_ON_to_date')
+    off_hist = _prep(off_df, 'NET_RATING', 'NET_OFF_to_date')
+
+    hist = on_hist.merge(off_hist, on=['PLAYER_ID', 'GAME_DATE'], how='outer')
+    hist = hist.sort_values(['PLAYER_ID', 'GAME_DATE']).reset_index(drop=True)
+    hist['DELTA_NET_to_date'] = hist['NET_ON_to_date'] - hist['NET_OFF_to_date']
+
+    return hist
+
+
+def process_lineups_data(
+    lineups_df: Optional[pd.DataFrame],
+    team_games: pd.DataFrame,
+) -> pd.DataFrame:
+    """Identify historical starters per team-date using lineup tables without game-level columns."""
+
+    if lineups_df is None or lineups_df.empty:
+        return pd.DataFrame(columns=['TEAM_ID', 'GAME_DATE', 'STARTING_LINEUP'])
+
+    # Prefer the season-level GROUP_ID layout used by the dashboards export.
+    if 'GROUP_ID' in lineups_df.columns:
+        required = {'TEAM_ID', 'GROUP_ID', 'GP'}
+        missing = required - set(lineups_df.columns)
+        if missing:
+            raise ValueError(f"Faltan columnas en lineups_df: {sorted(missing)}")
+
+        if {'TEAM_ID', 'GAME_DATE'}.difference(team_games.columns):
+            raise ValueError("team_games debe contener TEAM_ID y GAME_DATE")
+
+        team_dates = team_games[['TEAM_ID', 'GAME_DATE']].drop_duplicates()
+        team_dates['TEAM_ID'] = pd.to_numeric(team_dates['TEAM_ID'], errors='coerce')
+        team_dates = team_dates.dropna(subset=['TEAM_ID'])
+        team_dates['TEAM_ID'] = team_dates['TEAM_ID'].astype('Int64')
+        team_dates['GAME_DATE'] = pd.to_datetime(team_dates['GAME_DATE'], errors='coerce')
+        team_dates = team_dates.sort_values(['TEAM_ID', 'GAME_DATE']).reset_index(drop=True)
+
+        aggregated = lineups_df[list(required)].copy()
+        aggregated['TEAM_ID'] = pd.to_numeric(aggregated['TEAM_ID'], errors='coerce')
+        aggregated = aggregated.dropna(subset=['TEAM_ID'])
+        aggregated['TEAM_ID'] = aggregated['TEAM_ID'].astype('Int64')
+        aggregated['GP'] = pd.to_numeric(aggregated['GP'], errors='coerce').fillna(0.0)
+
+        def _parse_group(group_id: object) -> List[int]:
+            if pd.isna(group_id):
+                return []
+            tokens = str(group_id).strip().split('-')
+            parsed: List[int] = []
+            for token in tokens:
+                token = token.strip()
+                if not token:
+                    continue
+                token = re.sub(r"\.0$", "", token)
+                try:
+                    value = int(float(token))
+                except (TypeError, ValueError):
+                    continue
+                parsed.append(value)
+            return parsed
+
+        aggregated['STARTING_LINEUP'] = aggregated['GROUP_ID'].apply(_parse_group)
+        aggregated = aggregated[aggregated['STARTING_LINEUP'].map(len) == 5]
+
+        if aggregated.empty:
+            team_dates['STARTING_LINEUP'] = [[] for _ in range(len(team_dates))]
+            return team_dates[['TEAM_ID', 'GAME_DATE', 'STARTING_LINEUP']]
+
+        sort_cols = ['TEAM_ID', 'GP']
+        ascending = [True, False]
+
+        if 'MIN' in lineups_df.columns:
+            aggregated['MIN'] = pd.to_numeric(
+                lineups_df.loc[aggregated.index, 'MIN'], errors='coerce'
+            ).fillna(0.0)
+            sort_cols.append('MIN')
+            ascending.append(False)
+
+        aggregated = aggregated.sort_values(sort_cols, ascending=ascending)
+        aggregated = aggregated.drop_duplicates('TEAM_ID', keep='first')
+
+        starters = team_dates.merge(
+            aggregated[['TEAM_ID', 'STARTING_LINEUP']],
+            on='TEAM_ID',
+            how='left',
+        )
+        starters['STARTING_LINEUP'] = starters['STARTING_LINEUP'].apply(
+            lambda x: [int(v) for v in x if pd.notna(v)]
+            if isinstance(x, (list, tuple, np.ndarray))
+            else []
+        )
+
+        starters = starters[['TEAM_ID', 'GAME_DATE', 'STARTING_LINEUP']]
+        starters = starters.sort_values(['TEAM_ID', 'GAME_DATE']).reset_index(drop=True)
+
+        return starters
+
+    # Retain compatibility with true game-level lineup exports when available.
+    if {'GAME_ID', 'PLAYER_ID'}.issubset(lineups_df.columns):
+        if {'GAME_ID', 'TEAM_ID', 'GAME_DATE'}.difference(team_games.columns):
+            raise ValueError("team_games debe contener GAME_ID, TEAM_ID y GAME_DATE")
+
+        team_dates = team_games[['GAME_ID', 'TEAM_ID', 'GAME_DATE']].drop_duplicates()
+        team_dates['GAME_DATE'] = pd.to_datetime(team_dates['GAME_DATE'], errors='coerce')
+
+        lineups = lineups_df[['TEAM_ID', 'GAME_ID', 'PLAYER_ID', 'MIN']].copy()
+        for col in ['TEAM_ID', 'GAME_ID', 'PLAYER_ID']:
+            lineups[col] = pd.to_numeric(lineups[col], errors='coerce')
+        lineups['MIN'] = pd.to_numeric(lineups['MIN'], errors='coerce').fillna(0.0)
+
+        agg = (
+            lineups.groupby(['TEAM_ID', 'GAME_ID', 'PLAYER_ID'], as_index=False)['MIN']
+            .sum()
+        )
+        agg = agg.merge(team_dates, on=['TEAM_ID', 'GAME_ID'], how='inner', validate='many_to_one')
+        agg['GAME_DATE'] = pd.to_datetime(agg['GAME_DATE'], errors='coerce')
+        agg['TEAM_ID'] = pd.to_numeric(agg['TEAM_ID'], errors='coerce').astype('Int64')
+        agg['PLAYER_ID'] = pd.to_numeric(agg['PLAYER_ID'], errors='coerce').astype('Int64')
+        agg['GAME_ID'] = pd.to_numeric(agg['GAME_ID'], errors='coerce').astype('Int64')
+        agg = agg.sort_values(['TEAM_ID', 'PLAYER_ID', 'GAME_DATE']).reset_index(drop=True)
+
+        agg['MIN_CUM'] = agg.groupby(['TEAM_ID', 'PLAYER_ID'])['MIN'].cumsum()
+        agg['MIN_CUM_PREV'] = (agg['MIN_CUM'] - agg['MIN']).clip(lower=0)
+        agg = agg.drop(columns=['MIN_CUM'])
+
+        agg = agg.sort_values(['TEAM_ID', 'GAME_DATE', 'MIN_CUM_PREV'], ascending=[True, True, False])
+
+        starters = (
+            agg.groupby(['TEAM_ID', 'GAME_DATE'])['PLAYER_ID']
+            .apply(lambda s: s.head(5).dropna().astype('Int64').tolist())
+            .reset_index(name='STARTING_LINEUP')
+        )
+
+        return starters
+
+    raise ValueError(
+        "lineups_df debe contener columnas GROUP_ID o (GAME_ID y PLAYER_ID) para construir titulares"
+    )
+
+
+def compute_lineup_metrics_for_game(
+    team_id: int,
+    game_id: int,
+    game_date: pd.Timestamp,
+    player_hist: pd.DataFrame,
+    onoff_hist: Optional[pd.DataFrame],
+    starters_lookup,
+    config: Optional[Dict] = None,
+) -> Dict[str, float]:
+    """Compute lineup metrics for a single team-game ensuring no temporal leakage."""
+
+    cfg = _resolve_lineup_config(config)
+    fallback = {
+        'LINEUP_EFF_RATING': np.nan,
+        'LINEUP_EFF_ADJ': 0.0,
+        'LINEUP_STARTERS_OUT': 0.0,
+        'LINEUP_BENCH_DEPTH': 0.0,
+        'LINEUP_MIN_VAR': np.nan,
+        'LINEUP_AVAIL_PENALTY': 0.0,
+    }
+
+    if player_hist is None or player_hist.empty:
+        return fallback
+
+    mask = (player_hist['TEAM_ID'] == team_id) & (player_hist['GAME_ID'] == game_id)
+    players = player_hist.loc[mask].copy()
+    if players.empty:
+        return fallback
+
+    players['GAME_DATE'] = pd.to_datetime(players['GAME_DATE'], errors='coerce')
+    players['PLAYER_ID'] = pd.to_numeric(players['PLAYER_ID'], errors='coerce').astype('Int64')
+
+    use_on_off = bool(cfg.get('USE_ON_OFF', False))
+    if use_on_off and onoff_hist is not None and not onoff_hist.empty:
+        onoff_hist = onoff_hist.copy()
+        onoff_hist['GAME_DATE'] = pd.to_datetime(onoff_hist['GAME_DATE'], errors='coerce')
+        onoff_hist['PLAYER_ID'] = pd.to_numeric(onoff_hist['PLAYER_ID'], errors='coerce').astype('Int64')
+        players = players.merge(
+            onoff_hist,
+            on=['PLAYER_ID', 'GAME_DATE'],
+            how='left',
+        )
+
+    roll_col = f"MIN_roll{int(cfg.get('N_ROLL_MIN', 5))}_prev"
+    if roll_col in players.columns:
+        min_exp = pd.to_numeric(players[roll_col], errors='coerce')
+    else:
+        min_exp = pd.Series(np.nan, index=players.index)
+    players['MIN_EXPECTED'] = min_exp.fillna(cfg['MIN_EXP_FALLBACK'])
+
+    weight = players['MIN_EXPECTED'].clip(lower=0)
+    total_minutes = weight.sum()
+
+    def _weighted_average(values: pd.Series) -> float:
+        vals = pd.to_numeric(values, errors='coerce')
+        mask_valid = vals.notna() & weight.notna() & (weight > 0)
+        if mask_valid.any():
+            local_weights = weight[mask_valid]
+            if local_weights.sum() > 0:
+                return float(np.average(vals[mask_valid], weights=local_weights))
+        return np.nan
+
+    eff_rating = np.nan
+    if 'NET_RATING_to_date' in players.columns:
+        eff_rating = _weighted_average(players['NET_RATING_to_date'])
+
+    if np.isnan(eff_rating):
+        proxy_components = {
+            'PTS_to_date': 1.0,
+            'REB_to_date': 1.0,
+            'AST_to_date': 1.0,
+            'STL_to_date': 1.0,
+            'BLK_to_date': 1.0,
+            'TOV_to_date': -1.0,
+        }
+        proxy = pd.Series(0.0, index=players.index, dtype=float)
+        for col, sign in proxy_components.items():
+            if col in players.columns:
+                proxy = proxy + pd.to_numeric(players[col], errors='coerce').fillna(0.0) * sign
+        mask_weights = weight > 0
+        if total_minutes > 0 and mask_weights.any():
+            eff_rating = float(np.average(proxy[mask_weights], weights=weight[mask_weights]))
+
+    eff_adj = 0.0
+    if use_on_off and 'DELTA_NET_to_date' in players.columns:
+        eff_adj_val = _weighted_average(players['DELTA_NET_to_date'])
+        if not np.isnan(eff_adj_val):
+            eff_adj = float(eff_adj_val)
+
+    starters_out = 0.0
+    starters_list: List[int] = []
+    lookup_value = None
+    if starters_lookup:
+        if isinstance(starters_lookup, dict):
+            lookup_value = starters_lookup.get((team_id, pd.Timestamp(game_date) if pd.notna(game_date) else game_date))
+        elif isinstance(starters_lookup, pd.DataFrame) and not starters_lookup.empty:
+            mask_lookup = (starters_lookup['TEAM_ID'] == team_id) & (
+                pd.to_datetime(starters_lookup['GAME_DATE']) == pd.Timestamp(game_date)
+            )
+            if mask_lookup.any():
+                lookup_value = starters_lookup.loc[mask_lookup, 'STARTING_LINEUP'].iloc[0]
+    if lookup_value is not None:
+        if isinstance(lookup_value, list):
+            starters_list = [int(x) for x in lookup_value if pd.notna(x)]
+        elif pd.notna(lookup_value):
+            starters_list = [int(lookup_value)]
+
+    active_players = players['PLAYER_ID'].dropna().astype(int).tolist()
+    active_set = set(active_players)
+    if starters_list:
+        starters_out = float(sum(1 for pid in starters_list if pid not in active_set))
+
+    min_threshold = cfg.get('MIN_BENCH_THRESHOLD', 15)
+    bench_candidates = players.copy()
+    if starters_list:
+        bench_candidates = bench_candidates[~bench_candidates['PLAYER_ID'].isin(starters_list)]
+    bench_depth = float(
+        bench_candidates.loc[bench_candidates['MIN_EXPECTED'] >= min_threshold, 'PLAYER_ID'].nunique()
+    )
+
+    top8 = players.sort_values('MIN_EXPECTED', ascending=False).head(8)
+    if top8.empty or top8['MIN_EXPECTED'].isna().all():
+        min_var = np.nan
+    else:
+        mins = pd.to_numeric(top8['MIN_EXPECTED'], errors='coerce').dropna()
+        if len(mins) >= 2:
+            min_var = float(np.var(mins, ddof=0))
+        else:
+            min_var = 0.0
+
+    avail_penalty = 0.15 * starters_out
+
+    return {
+        'LINEUP_EFF_RATING': float(eff_rating) if not np.isnan(eff_rating) else np.nan,
+        'LINEUP_EFF_ADJ': float(eff_adj),
+        'LINEUP_STARTERS_OUT': starters_out,
+        'LINEUP_BENCH_DEPTH': bench_depth,
+        'LINEUP_MIN_VAR': min_var,
+        'LINEUP_AVAIL_PENALTY': float(avail_penalty),
+    }
+
+
+def add_lineup_features_in_memory(
+    df_teamgames: pd.DataFrame,
+    df_player_box: pd.DataFrame,
+    df_on: Optional[pd.DataFrame] = None,
+    df_off: Optional[pd.DataFrame] = None,
+    df_lineups: Optional[pd.DataFrame] = None,
+    config: Optional[Dict] = None,
+) -> pd.DataFrame:
+    """Augment team games with lineup-based features computed without leakage."""
+
+    cfg = _resolve_lineup_config(config)
+
+    required_team_cols = {'GAME_ID', 'TEAM_ID', 'GAME_DATE'}
+    missing_team = required_team_cols - set(df_teamgames.columns)
+    if missing_team:
+        raise ValueError(f"Faltan columnas en df_teamgames: {sorted(missing_team)}")
+
+    required_player_cols = {'GAME_ID', 'TEAM_ID', 'PLAYER_ID'}
+    missing_player = required_player_cols - set(df_player_box.columns)
+    if missing_player:
+        raise ValueError(f"Faltan columnas en df_player_box: {sorted(missing_player)}")
+
+    df_team = prep_dates(df_teamgames, 'GAME_DATE')
+    df_team['TEAM_ID'] = pd.to_numeric(df_team['TEAM_ID'], errors='coerce').astype('Int64')
+    df_team['GAME_ID'] = pd.to_numeric(df_team['GAME_ID'], errors='coerce').astype('Int64')
+
+    mean_cols = ['PTS', 'REB', 'AST', 'STL', 'BLK', 'TOV', 'MIN', 'NET_RATING', 'TS_PCT', 'USG_PCT']
+    roll_cols = ['MIN', 'PTS', 'AST', 'REB']
+
+    player_hist = build_player_to_date_in_memory(
+        player_box=df_player_box,
+        team_games=df_team,
+        mean_cols=mean_cols,
+        roll_cols=roll_cols,
+        config=cfg,
+    )
+
+    if cfg.get('USE_ON_OFF', True):
+        onoff_hist = compute_on_off_to_date_in_memory(df_on, df_off, df_team)
+    else:
+        onoff_hist = pd.DataFrame(columns=['PLAYER_ID', 'GAME_DATE', 'NET_ON_to_date', 'NET_OFF_to_date', 'DELTA_NET_to_date'])
+
+    if cfg.get('USE_LINEUPS', True):
+        starters_df = process_lineups_data(df_lineups, df_team)
+        if not starters_df.empty:
+            starters_df['TEAM_ID'] = pd.to_numeric(starters_df['TEAM_ID'], errors='coerce').astype('Int64')
+        starters_lookup = {
+            (int(row.TEAM_ID) if pd.notna(row.TEAM_ID) else row.TEAM_ID, pd.Timestamp(row.GAME_DATE)):
+            row.STARTING_LINEUP
+            for row in starters_df.itertuples()
+        }
+    else:
+        starters_lookup = {}
+
+    teamgames_sorted = df_team.sort_values('GAME_DATE').reset_index(drop=True)
+
+    lineup_records = []
+    for row in teamgames_sorted.itertuples(index=False):
+        metrics = compute_lineup_metrics_for_game(
+            team_id=int(row.TEAM_ID) if pd.notna(row.TEAM_ID) else row.TEAM_ID,
+            game_id=int(row.GAME_ID) if pd.notna(row.GAME_ID) else row.GAME_ID,
+            game_date=row.GAME_DATE,
+            player_hist=player_hist,
+            onoff_hist=onoff_hist,
+            starters_lookup=starters_lookup,
+            config=cfg,
+        )
+        metrics.update({'TEAM_ID': row.TEAM_ID, 'GAME_ID': row.GAME_ID, 'GAME_DATE': row.GAME_DATE})
+        lineup_records.append(metrics)
+
+    if not lineup_records:
+        return df_teamgames.copy()
+
+    lineup_df = pd.DataFrame(lineup_records)
+
+    low_pct, high_pct = cfg.get('TEAM_PCTL', (5, 95))
+
+    def _percentile_norm(group: pd.DataFrame, column: str) -> pd.Series:
+        history: List[float] = []
+        normalized: List[float] = []
+        for value in group[column]:
+            valid_hist = [h for h in history if not np.isnan(h)]
+            if valid_hist and not pd.isna(value):
+                p_low = float(np.percentile(valid_hist, low_pct))
+                p_high = float(np.percentile(valid_hist, high_pct))
+                if np.isclose(p_high, p_low):
+                    norm_val = 0.5
+                else:
+                    norm_val = float(
+                        np.clip((float(value) - p_low) / (p_high - p_low), 0.0, 1.0)
+                    )
+            else:
+                norm_val = 0.5
+
+            if pd.isna(value):
+                normalized.append(0.5)
+            else:
+                normalized.append(norm_val if not np.isnan(norm_val) else 0.5)
+                history.append(float(value))
+
+        return pd.Series(normalized, index=group.index, dtype=float)
+
+    metrics_to_normalize = {
+        'LINEUP_EFF_RATING': None,
+        'LINEUP_EFF_ADJ': None,
+        'LINEUP_BENCH_DEPTH': None,
+        'LINEUP_AVAIL_PENALTY': None,
+    }
+
+    lineup_sorted = lineup_df.sort_values(['TEAM_ID', 'GAME_DATE'])
+    for metric in metrics_to_normalize:
+        lineup_df[f'{metric}_NORM'] = (
+            lineup_sorted.groupby('TEAM_ID', group_keys=False)
+            .apply(
+                lambda g, col=metric: _percentile_norm(g, col),
+                include_groups=False,
+            )
+        )
+
+    score = np.zeros(len(lineup_df))
+    for key, weight in cfg['LINEUP_WEIGHTS'].items():
+        metric_name = f'LINEUP_{key}'
+        norm_col = f'{metric_name}_NORM'
+        if norm_col in lineup_df.columns:
+            vals = lineup_df[norm_col].fillna(0.5)
+            score += weight * vals
+
+    lineup_df['LINEUP_SCORE'] = np.clip(score, 0.0, 1.0)
+
+    output_cols = [
+        'TEAM_ID',
+        'GAME_ID',
+        'LINEUP_EFF_RATING',
+        'LINEUP_EFF_ADJ',
+        'LINEUP_STARTERS_OUT',
+        'LINEUP_BENCH_DEPTH',
+        'LINEUP_MIN_VAR',
+        'LINEUP_AVAIL_PENALTY',
+        'LINEUP_SCORE',
+    ]
+
+    result = df_teamgames.copy()
+
+    for key in ('TEAM_ID', 'GAME_ID'):
+        if key in lineup_df.columns:
+            lineup_df[key] = _to_key_str(lineup_df[key])
+        if key in result.columns:
+            result[key] = _to_key_str(result[key])
+
+    result = result.merge(lineup_df[output_cols], on=['TEAM_ID', 'GAME_ID'], how='left')
+    return result
 
 
 def _infer_datetime_column(df: pd.DataFrame, *, min_valid_ratio: float = 0.6) -> str | None:
@@ -497,7 +1112,11 @@ def features_enhanced(df: pd.DataFrame, config: Dict[str, object]) -> pd.DataFra
         g['DAYS_REST_RANGE'] = g['DAYS_REST'].map(_format_range)
         return g
 
-    d = d.groupby(group_cols, group_keys=False).apply(process_group).reset_index(drop=True)
+    d = (
+        d.groupby(group_cols, group_keys=False)
+        .apply(process_group, include_groups=False)
+        .reset_index(drop=True)
+    )
 
     # === Refuerzo con parquet de descanso (opcional) usando MERGE SEGURO ===
     days_path = (config or {}).get('days_rest_path') if isinstance(config, dict) else None
