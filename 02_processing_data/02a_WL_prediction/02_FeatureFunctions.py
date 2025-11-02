@@ -396,49 +396,113 @@ def process_lineups_data(
     lineups_df: Optional[pd.DataFrame],
     team_games: pd.DataFrame,
 ) -> pd.DataFrame:
-    """Identify historical starters per team-date using cumulative minutes."""
+    """Identify historical starters per team-date using either game-level or season-level lineups."""
 
     if lineups_df is None or lineups_df.empty:
         return pd.DataFrame(columns=['TEAM_ID', 'GAME_DATE', 'STARTING_LINEUP'])
 
-    required = {'TEAM_ID', 'GAME_ID', 'PLAYER_ID', 'MIN'}
+    has_game_level = {'GAME_ID', 'PLAYER_ID'}.issubset(lineups_df.columns)
+
+    if has_game_level:
+        if {'GAME_ID', 'TEAM_ID', 'GAME_DATE'}.difference(team_games.columns):
+            raise ValueError("team_games debe contener GAME_ID, TEAM_ID y GAME_DATE")
+
+        team_dates = team_games[['GAME_ID', 'TEAM_ID', 'GAME_DATE']].drop_duplicates()
+        team_dates['GAME_DATE'] = pd.to_datetime(team_dates['GAME_DATE'], errors='coerce')
+
+        lineups = lineups_df[['TEAM_ID', 'GAME_ID', 'PLAYER_ID', 'MIN']].copy()
+        for col in ['TEAM_ID', 'GAME_ID', 'PLAYER_ID']:
+            lineups[col] = pd.to_numeric(lineups[col], errors='coerce')
+        lineups['MIN'] = pd.to_numeric(lineups['MIN'], errors='coerce').fillna(0.0)
+
+        agg = (
+            lineups.groupby(['TEAM_ID', 'GAME_ID', 'PLAYER_ID'], as_index=False)['MIN']
+            .sum()
+        )
+        agg = agg.merge(team_dates, on=['TEAM_ID', 'GAME_ID'], how='inner', validate='many_to_one')
+        agg['GAME_DATE'] = pd.to_datetime(agg['GAME_DATE'], errors='coerce')
+        agg['TEAM_ID'] = pd.to_numeric(agg['TEAM_ID'], errors='coerce').astype('Int64')
+        agg['PLAYER_ID'] = pd.to_numeric(agg['PLAYER_ID'], errors='coerce').astype('Int64')
+        agg['GAME_ID'] = pd.to_numeric(agg['GAME_ID'], errors='coerce').astype('Int64')
+        agg = agg.sort_values(['TEAM_ID', 'PLAYER_ID', 'GAME_DATE']).reset_index(drop=True)
+
+        agg['MIN_CUM'] = agg.groupby(['TEAM_ID', 'PLAYER_ID'])['MIN'].cumsum()
+        agg['MIN_CUM_PREV'] = (agg['MIN_CUM'] - agg['MIN']).clip(lower=0)
+        agg = agg.drop(columns=['MIN_CUM'])
+
+        agg = agg.sort_values(['TEAM_ID', 'GAME_DATE', 'MIN_CUM_PREV'], ascending=[True, True, False])
+
+        starters = (
+            agg.groupby(['TEAM_ID', 'GAME_DATE'])['PLAYER_ID']
+            .apply(lambda s: s.head(5).dropna().astype('Int64').tolist())
+            .reset_index(name='STARTING_LINEUP')
+        )
+
+        return starters
+
+    required = {'TEAM_ID', 'GROUP_ID', 'GP'}
     missing = required - set(lineups_df.columns)
     if missing:
         raise ValueError(f"Faltan columnas en lineups_df: {sorted(missing)}")
 
-    if {'GAME_ID', 'TEAM_ID', 'GAME_DATE'}.difference(team_games.columns):
-        raise ValueError("team_games debe contener GAME_ID, TEAM_ID y GAME_DATE")
+    if {'TEAM_ID', 'GAME_DATE'}.difference(team_games.columns):
+        raise ValueError("team_games debe contener TEAM_ID y GAME_DATE")
 
-    team_dates = team_games[['GAME_ID', 'TEAM_ID', 'GAME_DATE']].drop_duplicates()
+    team_dates = team_games[['TEAM_ID', 'GAME_DATE']].drop_duplicates()
+    team_dates['TEAM_ID'] = pd.to_numeric(team_dates['TEAM_ID'], errors='coerce')
+    team_dates = team_dates.dropna(subset=['TEAM_ID'])
+    team_dates['TEAM_ID'] = team_dates['TEAM_ID'].astype('Int64')
     team_dates['GAME_DATE'] = pd.to_datetime(team_dates['GAME_DATE'], errors='coerce')
+    team_dates = team_dates.sort_values(['TEAM_ID', 'GAME_DATE']).reset_index(drop=True)
 
-    lineups = lineups_df[['TEAM_ID', 'GAME_ID', 'PLAYER_ID', 'MIN']].copy()
-    for col in ['TEAM_ID', 'GAME_ID', 'PLAYER_ID']:
-        lineups[col] = pd.to_numeric(lineups[col], errors='coerce')
-    lineups['MIN'] = pd.to_numeric(lineups['MIN'], errors='coerce').fillna(0.0)
+    aggregated = lineups_df[list(required)].copy()
+    aggregated['TEAM_ID'] = pd.to_numeric(aggregated['TEAM_ID'], errors='coerce')
+    aggregated = aggregated.dropna(subset=['TEAM_ID'])
+    aggregated['TEAM_ID'] = aggregated['TEAM_ID'].astype('Int64')
+    aggregated['GP'] = pd.to_numeric(aggregated['GP'], errors='coerce').fillna(0.0)
 
-    agg = (
-        lineups.groupby(['TEAM_ID', 'GAME_ID', 'PLAYER_ID'], as_index=False)['MIN']
-        .sum()
+    def _parse_group(group_id: object) -> List[int]:
+        if pd.isna(group_id):
+            return []
+        tokens = str(group_id).strip().split('-')
+        parsed: List[int] = []
+        for token in tokens:
+            token = token.strip()
+            if not token:
+                continue
+            token = re.sub(r"\.0$", "", token)
+            try:
+                value = int(float(token))
+            except (TypeError, ValueError):
+                continue
+            parsed.append(value)
+        return parsed
+
+    aggregated['STARTING_LINEUP'] = aggregated['GROUP_ID'].apply(_parse_group)
+    aggregated = aggregated[aggregated['STARTING_LINEUP'].map(len) > 0]
+
+    if aggregated.empty:
+        team_dates['STARTING_LINEUP'] = [[] for _ in range(len(team_dates))]
+        return team_dates[['TEAM_ID', 'GAME_DATE', 'STARTING_LINEUP']]
+
+    sort_cols = ['TEAM_ID', 'GP']
+    ascending = [True, False]
+
+    if 'MIN' in lineups_df.columns:
+        aggregated['MIN'] = pd.to_numeric(lineups_df.loc[aggregated.index, 'MIN'], errors='coerce').fillna(0.0)
+        sort_cols.append('MIN')
+        ascending.append(False)
+
+    aggregated = aggregated.sort_values(sort_cols, ascending=ascending)
+    aggregated = aggregated.drop_duplicates('TEAM_ID', keep='first')
+
+    starters = team_dates.merge(aggregated[['TEAM_ID', 'STARTING_LINEUP']], on='TEAM_ID', how='left')
+    starters['STARTING_LINEUP'] = starters['STARTING_LINEUP'].apply(
+        lambda x: [int(v) for v in x if pd.notna(v)] if isinstance(x, (list, tuple, np.ndarray)) else []
     )
-    agg = agg.merge(team_dates, on=['TEAM_ID', 'GAME_ID'], how='inner', validate='many_to_one')
-    agg['GAME_DATE'] = pd.to_datetime(agg['GAME_DATE'], errors='coerce')
-    agg['TEAM_ID'] = pd.to_numeric(agg['TEAM_ID'], errors='coerce').astype('Int64')
-    agg['PLAYER_ID'] = pd.to_numeric(agg['PLAYER_ID'], errors='coerce').astype('Int64')
-    agg['GAME_ID'] = pd.to_numeric(agg['GAME_ID'], errors='coerce').astype('Int64')
-    agg = agg.sort_values(['TEAM_ID', 'PLAYER_ID', 'GAME_DATE']).reset_index(drop=True)
 
-    agg['MIN_CUM'] = agg.groupby(['TEAM_ID', 'PLAYER_ID'])['MIN'].cumsum()
-    agg['MIN_CUM_PREV'] = (agg['MIN_CUM'] - agg['MIN']).clip(lower=0)
-    agg = agg.drop(columns=['MIN_CUM'])
-
-    agg = agg.sort_values(['TEAM_ID', 'GAME_DATE', 'MIN_CUM_PREV'], ascending=[True, True, False])
-
-    starters = (
-        agg.groupby(['TEAM_ID', 'GAME_DATE'])['PLAYER_ID']
-        .apply(lambda s: s.head(5).dropna().astype('Int64').tolist())
-        .reset_index(name='STARTING_LINEUP')
-    )
+    starters = starters[['TEAM_ID', 'GAME_DATE', 'STARTING_LINEUP']]
+    starters = starters.sort_values(['TEAM_ID', 'GAME_DATE']).reset_index(drop=True)
 
     return starters
 
