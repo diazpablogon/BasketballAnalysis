@@ -807,9 +807,9 @@ def add_lineup_features_in_memory(
 
     for key in ('TEAM_ID', 'GAME_ID'):
         if key in lineup_df.columns:
-            lineup_df[key] = lineup_df[key].astype(str)
+            lineup_df[key] = _to_key_str(lineup_df[key])
         if key in result.columns:
-            result[key] = result[key].astype(str)
+            result[key] = _to_key_str(result[key])
 
     result = result.merge(lineup_df[output_cols], on=['TEAM_ID', 'GAME_ID'], how='left')
     return result
