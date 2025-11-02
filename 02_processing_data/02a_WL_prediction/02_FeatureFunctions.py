@@ -321,12 +321,75 @@ def compute_on_off_to_date_in_memory(
     off_df: Optional[pd.DataFrame],
     team_games: pd.DataFrame,
 ) -> pd.DataFrame:
-    """Safe placeholder: returns empty frame because on/off splits are season averages."""
+    """Compute rolling on/off metrics when per-game data is available.
 
-    print("⚠️  ON/OFF DESACTIVADO - Datos son promedios de temporada (no por juego)")
-    return pd.DataFrame(
+    The function inspects the structure of the provided DataFrames and only
+    computes historical averages when GAME_ID is present. If the supplied data
+    is aggregated at the season level (lacking GAME_ID), it returns an empty
+    DataFrame to avoid temporal leakage while signalling the condition.
+    """
+
+    empty = pd.DataFrame(
         columns=['PLAYER_ID', 'GAME_DATE', 'NET_ON_to_date', 'NET_OFF_to_date', 'DELTA_NET_to_date']
     )
+
+    if on_df is None or off_df is None:
+        return empty
+
+    if on_df.empty or off_df.empty:
+        return empty
+
+    has_game_id = 'GAME_ID' in on_df.columns and 'GAME_ID' in off_df.columns
+
+    if not has_game_id:
+        print(
+            "⚠️  ON/OFF DESACTIVADO - Datos agregados por temporada sin GAME_ID."
+            " Se omiten para prevenir leakage."
+        )
+        return empty
+
+    required_cols = {'PLAYER_ID', 'GAME_ID', 'NET_RATING'}
+
+    missing_on = required_cols - set(on_df.columns)
+    missing_off = required_cols - set(off_df.columns)
+    if missing_on:
+        raise ValueError(f"Faltan columnas en on_df: {sorted(missing_on)}")
+    if missing_off:
+        raise ValueError(f"Faltan columnas en off_df: {sorted(missing_off)}")
+
+    if {'GAME_ID', 'GAME_DATE'}.difference(team_games.columns):
+        raise ValueError("team_games debe contener GAME_ID y GAME_DATE para cruzar on/off")
+
+    team_dates = team_games[['GAME_ID', 'GAME_DATE']].drop_duplicates()
+    team_dates['GAME_DATE'] = pd.to_datetime(team_dates['GAME_DATE'], errors='coerce')
+
+    def _prep(df: pd.DataFrame, value_col: str, out_col: str) -> pd.DataFrame:
+        subset = df[['PLAYER_ID', 'GAME_ID', value_col]].copy()
+        subset['PLAYER_ID'] = pd.to_numeric(subset['PLAYER_ID'], errors='coerce').astype('Int64')
+        subset['GAME_ID'] = pd.to_numeric(subset['GAME_ID'], errors='coerce').astype('Int64')
+        subset[value_col] = pd.to_numeric(subset[value_col], errors='coerce')
+        subset = subset.merge(team_dates, on='GAME_ID', how='inner', validate='many_to_one')
+        subset = subset.dropna(subset=['PLAYER_ID', 'GAME_ID', 'GAME_DATE'])
+        subset = subset.sort_values(['PLAYER_ID', 'GAME_DATE']).reset_index(drop=True)
+        subset = subset.groupby(['PLAYER_ID', 'GAME_DATE'], as_index=False)[value_col].mean()
+        subset[out_col] = (
+            subset.groupby('PLAYER_ID')[value_col]
+            .expanding(min_periods=1)
+            .mean()
+            .shift(1)
+            .reset_index(level=0, drop=True)
+        )
+        subset = subset.drop(columns=[value_col])
+        return subset
+
+    on_hist = _prep(on_df, 'NET_RATING', 'NET_ON_to_date')
+    off_hist = _prep(off_df, 'NET_RATING', 'NET_OFF_to_date')
+
+    hist = on_hist.merge(off_hist, on=['PLAYER_ID', 'GAME_DATE'], how='outer')
+    hist = hist.sort_values(['PLAYER_ID', 'GAME_DATE']).reset_index(drop=True)
+    hist['DELTA_NET_to_date'] = hist['NET_ON_to_date'] - hist['NET_OFF_to_date']
+
+    return hist
 
 
 def process_lineups_data(
