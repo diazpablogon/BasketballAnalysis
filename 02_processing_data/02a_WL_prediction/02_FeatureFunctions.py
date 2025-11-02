@@ -396,14 +396,89 @@ def process_lineups_data(
     lineups_df: Optional[pd.DataFrame],
     team_games: pd.DataFrame,
 ) -> pd.DataFrame:
-    """Identify historical starters per team-date using either game-level or season-level lineups."""
+    """Identify historical starters per team-date using lineup tables without game-level columns."""
 
     if lineups_df is None or lineups_df.empty:
         return pd.DataFrame(columns=['TEAM_ID', 'GAME_DATE', 'STARTING_LINEUP'])
 
-    has_game_level = {'GAME_ID', 'PLAYER_ID'}.issubset(lineups_df.columns)
+    # Prefer the season-level GROUP_ID layout used by the dashboards export.
+    if 'GROUP_ID' in lineups_df.columns:
+        required = {'TEAM_ID', 'GROUP_ID', 'GP'}
+        missing = required - set(lineups_df.columns)
+        if missing:
+            raise ValueError(f"Faltan columnas en lineups_df: {sorted(missing)}")
 
-    if has_game_level:
+        if {'TEAM_ID', 'GAME_DATE'}.difference(team_games.columns):
+            raise ValueError("team_games debe contener TEAM_ID y GAME_DATE")
+
+        team_dates = team_games[['TEAM_ID', 'GAME_DATE']].drop_duplicates()
+        team_dates['TEAM_ID'] = pd.to_numeric(team_dates['TEAM_ID'], errors='coerce')
+        team_dates = team_dates.dropna(subset=['TEAM_ID'])
+        team_dates['TEAM_ID'] = team_dates['TEAM_ID'].astype('Int64')
+        team_dates['GAME_DATE'] = pd.to_datetime(team_dates['GAME_DATE'], errors='coerce')
+        team_dates = team_dates.sort_values(['TEAM_ID', 'GAME_DATE']).reset_index(drop=True)
+
+        aggregated = lineups_df[list(required)].copy()
+        aggregated['TEAM_ID'] = pd.to_numeric(aggregated['TEAM_ID'], errors='coerce')
+        aggregated = aggregated.dropna(subset=['TEAM_ID'])
+        aggregated['TEAM_ID'] = aggregated['TEAM_ID'].astype('Int64')
+        aggregated['GP'] = pd.to_numeric(aggregated['GP'], errors='coerce').fillna(0.0)
+
+        def _parse_group(group_id: object) -> List[int]:
+            if pd.isna(group_id):
+                return []
+            tokens = str(group_id).strip().split('-')
+            parsed: List[int] = []
+            for token in tokens:
+                token = token.strip()
+                if not token:
+                    continue
+                token = re.sub(r"\.0$", "", token)
+                try:
+                    value = int(float(token))
+                except (TypeError, ValueError):
+                    continue
+                parsed.append(value)
+            return parsed
+
+        aggregated['STARTING_LINEUP'] = aggregated['GROUP_ID'].apply(_parse_group)
+        aggregated = aggregated[aggregated['STARTING_LINEUP'].map(len) == 5]
+
+        if aggregated.empty:
+            team_dates['STARTING_LINEUP'] = [[] for _ in range(len(team_dates))]
+            return team_dates[['TEAM_ID', 'GAME_DATE', 'STARTING_LINEUP']]
+
+        sort_cols = ['TEAM_ID', 'GP']
+        ascending = [True, False]
+
+        if 'MIN' in lineups_df.columns:
+            aggregated['MIN'] = pd.to_numeric(
+                lineups_df.loc[aggregated.index, 'MIN'], errors='coerce'
+            ).fillna(0.0)
+            sort_cols.append('MIN')
+            ascending.append(False)
+
+        aggregated = aggregated.sort_values(sort_cols, ascending=ascending)
+        aggregated = aggregated.drop_duplicates('TEAM_ID', keep='first')
+
+        starters = team_dates.merge(
+            aggregated[['TEAM_ID', 'STARTING_LINEUP']],
+            on='TEAM_ID',
+            how='left',
+        )
+        starters['STARTING_LINEUP'] = starters['STARTING_LINEUP'].apply(
+            lambda x: [int(v) for v in x if pd.notna(v)]
+            if isinstance(x, (list, tuple, np.ndarray))
+            else []
+        )
+
+        starters = starters[['TEAM_ID', 'GAME_DATE', 'STARTING_LINEUP']]
+        starters = starters.sort_values(['TEAM_ID', 'GAME_DATE']).reset_index(drop=True)
+
+        return starters
+
+    # Retain compatibility with true game-level lineup exports when available.
+    if {'GAME_ID', 'PLAYER_ID'}.issubset(lineups_df.columns):
         if {'GAME_ID', 'TEAM_ID', 'GAME_DATE'}.difference(team_games.columns):
             raise ValueError("team_games debe contener GAME_ID, TEAM_ID y GAME_DATE")
 
@@ -440,71 +515,9 @@ def process_lineups_data(
 
         return starters
 
-    required = {'TEAM_ID', 'GROUP_ID', 'GP'}
-    missing = required - set(lineups_df.columns)
-    if missing:
-        raise ValueError(f"Faltan columnas en lineups_df: {sorted(missing)}")
-
-    if {'TEAM_ID', 'GAME_DATE'}.difference(team_games.columns):
-        raise ValueError("team_games debe contener TEAM_ID y GAME_DATE")
-
-    team_dates = team_games[['TEAM_ID', 'GAME_DATE']].drop_duplicates()
-    team_dates['TEAM_ID'] = pd.to_numeric(team_dates['TEAM_ID'], errors='coerce')
-    team_dates = team_dates.dropna(subset=['TEAM_ID'])
-    team_dates['TEAM_ID'] = team_dates['TEAM_ID'].astype('Int64')
-    team_dates['GAME_DATE'] = pd.to_datetime(team_dates['GAME_DATE'], errors='coerce')
-    team_dates = team_dates.sort_values(['TEAM_ID', 'GAME_DATE']).reset_index(drop=True)
-
-    aggregated = lineups_df[list(required)].copy()
-    aggregated['TEAM_ID'] = pd.to_numeric(aggregated['TEAM_ID'], errors='coerce')
-    aggregated = aggregated.dropna(subset=['TEAM_ID'])
-    aggregated['TEAM_ID'] = aggregated['TEAM_ID'].astype('Int64')
-    aggregated['GP'] = pd.to_numeric(aggregated['GP'], errors='coerce').fillna(0.0)
-
-    def _parse_group(group_id: object) -> List[int]:
-        if pd.isna(group_id):
-            return []
-        tokens = str(group_id).strip().split('-')
-        parsed: List[int] = []
-        for token in tokens:
-            token = token.strip()
-            if not token:
-                continue
-            token = re.sub(r"\.0$", "", token)
-            try:
-                value = int(float(token))
-            except (TypeError, ValueError):
-                continue
-            parsed.append(value)
-        return parsed
-
-    aggregated['STARTING_LINEUP'] = aggregated['GROUP_ID'].apply(_parse_group)
-    aggregated = aggregated[aggregated['STARTING_LINEUP'].map(len) > 0]
-
-    if aggregated.empty:
-        team_dates['STARTING_LINEUP'] = [[] for _ in range(len(team_dates))]
-        return team_dates[['TEAM_ID', 'GAME_DATE', 'STARTING_LINEUP']]
-
-    sort_cols = ['TEAM_ID', 'GP']
-    ascending = [True, False]
-
-    if 'MIN' in lineups_df.columns:
-        aggregated['MIN'] = pd.to_numeric(lineups_df.loc[aggregated.index, 'MIN'], errors='coerce').fillna(0.0)
-        sort_cols.append('MIN')
-        ascending.append(False)
-
-    aggregated = aggregated.sort_values(sort_cols, ascending=ascending)
-    aggregated = aggregated.drop_duplicates('TEAM_ID', keep='first')
-
-    starters = team_dates.merge(aggregated[['TEAM_ID', 'STARTING_LINEUP']], on='TEAM_ID', how='left')
-    starters['STARTING_LINEUP'] = starters['STARTING_LINEUP'].apply(
-        lambda x: [int(v) for v in x if pd.notna(v)] if isinstance(x, (list, tuple, np.ndarray)) else []
+    raise ValueError(
+        "lineups_df debe contener columnas GROUP_ID o (GAME_ID y PLAYER_ID) para construir titulares"
     )
-
-    starters = starters[['TEAM_ID', 'GAME_DATE', 'STARTING_LINEUP']]
-    starters = starters.sort_values(['TEAM_ID', 'GAME_DATE']).reset_index(drop=True)
-
-    return starters
 
 
 def compute_lineup_metrics_for_game(
