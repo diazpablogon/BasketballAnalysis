@@ -420,7 +420,7 @@ def compute_lineup_synergy_from_dashboard(
     df_lineups: pd.DataFrame,
     M0_lineup_minutes: int = 300,
 ) -> pd.DataFrame:
-    """Calcula la sinergia bayesiana de las alineaciones históricas."""
+    """Calcula la sinergia bayesiana de las alineaciones históricas usando PLUS_MINUS."""
 
     if M0_lineup_minutes <= 0:
         raise ValueError('M0_lineup_minutes debe ser positivo.')
@@ -432,25 +432,30 @@ def compute_lineup_synergy_from_dashboard(
     d['GROUP_ID'] = d['GROUP_ID'].astype('string')
     d['minutes_lineup'] = _coerce_minutes_series(d, ('MIN', 'MIN__sum', 'MINUTES', 'MIN_SUM'))
 
-    net_col = _find_column_case_insensitive(d.columns, 'NET_RATING')
-    if net_col is None:
-        raise ValueError('No se encontró columna NET_RATING en el dashboard de lineups.')
+    plus_minus_col = 'PLUS_MINUS'
+    if plus_minus_col not in d.columns:
+        raise ValueError(f'No se encontró columna {plus_minus_col} en el dashboard de lineups.')
 
-    d['net_lineup'] = pd.to_numeric(d[net_col], errors='coerce').fillna(0.0)
+    d['plus_minus_lineup'] = pd.to_numeric(d[plus_minus_col], errors='coerce').fillna(0.0)
 
     team_minutes = d.groupby('TEAM_ID')['minutes_lineup'].sum()
-    team_weighted_net = d.groupby('TEAM_ID').apply(
-        lambda x: np.average(x['net_lineup'], weights=np.clip(x['minutes_lineup'], 1e-6, None))
+    team_weighted_plus_minus = d.groupby('TEAM_ID').apply(
+        lambda x: np.average(
+            x['plus_minus_lineup'],
+            weights=np.clip(x['minutes_lineup'], 1e-6, None),
+        )
         if (x['minutes_lineup'] > 0).any()
         else 0.0
     )
-    net_team = team_weighted_net.reindex(team_minutes.index).fillna(0.0)
+    plus_minus_team = team_weighted_plus_minus.reindex(team_minutes.index).fillna(0.0)
 
-    d['net_team'] = d['TEAM_ID'].map(net_team).fillna(0.0)
+    d['plus_minus_team'] = d['TEAM_ID'].map(plus_minus_team).fillna(0.0)
     d['weight'] = d['minutes_lineup'] / (d['minutes_lineup'] + float(M0_lineup_minutes))
-    d['synergy'] = d['weight'] * d['net_lineup'] + (1.0 - d['weight']) * d['net_team']
+    d['synergy'] = d['weight'] * d['plus_minus_lineup'] + (1.0 - d['weight']) * d['plus_minus_team']
 
-    result = d[['TEAM_ID', 'GROUP_ID', 'synergy', 'minutes_lineup', 'net_lineup', 'net_team']].copy()
+    result = d[
+        ['TEAM_ID', 'GROUP_ID', 'synergy', 'minutes_lineup', 'plus_minus_lineup', 'plus_minus_team']
+    ].copy()
     result.attrs['M0_lineup_minutes'] = M0_lineup_minutes
 
     return result
@@ -481,7 +486,7 @@ def score_game_lineups(
     )
 
     synergy_lookup = synergy.set_index(['TEAM_ID', 'GROUP_ID'])
-    team_synergy = synergy.groupby('TEAM_ID')['net_team'].mean().fillna(0.0)
+    team_synergy = synergy.groupby('TEAM_ID')['plus_minus_team'].mean().fillna(0.0)
 
     scored_records: List[Dict[str, object]] = []
 
@@ -519,15 +524,16 @@ def score_game_lineups(
 
         minutes_hist = 0.0
         lineup_synergy = float(team_synergy.get(team_id, 0.0))
-        net_lineup = np.nan
+        plus_minus_lineup = np.nan
         if (team_id, lineup_id) in synergy_lookup.index:
             match_row = synergy_lookup.loc[(team_id, lineup_id)]
             minutes_hist = float(match_row.get('minutes_lineup', 0.0))
             lineup_synergy = float(match_row.get('synergy', lineup_synergy))
-            net_lineup = float(match_row.get('net_lineup', np.nan))
+            plus_minus_lineup = float(match_row.get('plus_minus_lineup', np.nan))
         else:
             print(
-                f"⚠️ Alineación {lineup_id} no encontrada para TEAM_ID={team_id}. Uso net_team como fallback."
+                f"⚠️ Alineación {lineup_id} no encontrada para TEAM_ID={team_id}. "
+                "Uso plus_minus_team como fallback."
             )
 
         lineup_score = alpha_quality * lineup_quality + (1.0 - alpha_quality) * lineup_synergy
@@ -543,7 +549,7 @@ def score_game_lineups(
                 'lineup_synergy': lineup_synergy,
                 'lineup_score': lineup_score,
                 'minutes_hist': minutes_hist,
-                'net_lineup_hist': net_lineup,
+                'plus_minus_lineup_hist': plus_minus_lineup,
             }
         )
 
