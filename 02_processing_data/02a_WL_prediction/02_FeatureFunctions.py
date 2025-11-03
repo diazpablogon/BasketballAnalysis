@@ -572,8 +572,13 @@ def build_lineup_scores_for_games(
     winsor_limits = tuple(params.get('winsor_limits', (0.05, 0.95)))
 
     box = _cast_ids_for_lineup(df_box, require_player=True)
-    if 'MATCHUP' not in box.columns:
-        raise ValueError('El boxscore necesita columna MATCHUP para identificar local/visitante.')
+
+    required_cols = ['GAME_ID', 'TEAM_ID']
+    missing_cols = [col for col in required_cols if col not in box.columns]
+    if missing_cols:
+        raise ValueError(
+            f"Se necesitan las columnas {missing_cols} para identificar equipos por juego."
+        )
 
     game_lineups = extract_game_lineups_from_boxscore(box)
     quality_players = compute_player_quality_from_onoff(
@@ -589,19 +594,40 @@ def build_lineup_scores_for_games(
         alpha_quality=alpha_quality,
     )
 
-    meta = box[['GAME_ID', 'TEAM_ID', 'MATCHUP']].drop_duplicates()
-    meta['IS_HOME'] = meta['MATCHUP'].astype(str).str.contains('vs', case=False, na=False)
+    meta = box[['GAME_ID', 'TEAM_ID']].drop_duplicates()
 
-    home = meta[meta['IS_HOME']].merge(scored, on=['GAME_ID', 'TEAM_ID'], how='left', suffixes=('', '_scored'))
-    away = meta[~meta['IS_HOME']].merge(scored, on=['GAME_ID', 'TEAM_ID'], how='left', suffixes=('', '_scored'))
+    team_counts = meta.groupby('GAME_ID')['TEAM_ID'].nunique()
+    invalid_games = team_counts[team_counts != 2]
+    if not invalid_games.empty:
+        sample = invalid_games.index.tolist()[:5]
+        raise ValueError(
+            'Cada GAME_ID debe tener exactamente 2 TEAM_ID distintos. '
+            f'Problemas detectados en: {sample}'
+        )
 
-    home = home.add_prefix('home_')
-    away = away.add_prefix('away_')
+    meta_scored = meta.merge(
+        scored,
+        on=['GAME_ID', 'TEAM_ID'],
+        how='left',
+        suffixes=('', '_scored'),
+    )
 
-    if 'home_GAME_ID' not in home.columns:
-        raise ValueError('No se pudo determinar el equipo local en el boxscore.')
-    if 'away_GAME_ID' not in away.columns:
-        raise ValueError('No se pudo determinar el equipo visitante en el boxscore.')
+    meta_scored = meta_scored.sort_values(['GAME_ID', 'TEAM_ID']).reset_index(drop=True)
+    meta_scored['TEAM_ORDER'] = meta_scored.groupby('GAME_ID').cumcount()
+
+    if meta_scored['TEAM_ORDER'].max() != 1:
+        raise ValueError('No se pudieron asignar exactamente dos equipos por GAME_ID.')
+
+    home = (
+        meta_scored[meta_scored['TEAM_ORDER'] == 0]
+        .drop(columns='TEAM_ORDER')
+        .add_prefix('home_')
+    )
+    away = (
+        meta_scored[meta_scored['TEAM_ORDER'] == 1]
+        .drop(columns='TEAM_ORDER')
+        .add_prefix('away_')
+    )
 
     combined = pd.merge(
         home,
