@@ -4,6 +4,7 @@ Versión con MERGE SEGURO para Days Rest usando clave string '_REST_KEY' = TEAM_
 
 from __future__ import annotations
 
+import logging
 import re
 from pathlib import Path
 from typing import Dict, List, Optional, Sequence, Tuple
@@ -35,6 +36,8 @@ REST_METRIC_RULES: Dict[str, Tuple[str, str]] = {
     'PTS': ('mean', 'REST_BUCKET_POINTS'),
 }
 
+logger = logging.getLogger(__name__)
+
 __all__ = [
     'DEFAULT_DAYS_REST',
     'ensure_teamid_and_date',
@@ -47,6 +50,12 @@ __all__ = [
     'features_venue',
     'build_match_dataset_enhanced',
     'fit_and_eval',
+    'build_lineup_id',
+    'extract_game_lineups_from_boxscore',
+    'compute_player_quality_from_onoff',
+    'compute_lineup_synergy_from_dashboard',
+    'score_game_lineups',
+    'build_lineup_scores_for_games',
 ]
 
 
@@ -198,6 +207,473 @@ def _find_column_case_insensitive(columns: pd.Index, *aliases: str) -> str | Non
         if cand_lower in lower_map:
             return lower_map[cand_lower]
     return None
+
+
+# =========================
+# Lineup score utilities
+# =========================
+def build_lineup_id(players: list[int]) -> str:
+    """Devuelve '-p1-p2-p3-p4-p5-' con los PLAYER_ID ordenados asc."""
+
+    if players is None:
+        players = []
+
+    normalized: List[int] = []
+    for p in players:
+        if pd.isna(p):
+            continue
+        normalized.append(int(p))
+
+    if not normalized:
+        return '-'
+
+    normalized = sorted(set(normalized))
+    return '-' + '-'.join(str(p) for p in normalized) + '-'
+
+
+def _cast_ids_for_lineup(df: pd.DataFrame, *, require_player: bool = False) -> pd.DataFrame:
+    d = df.copy()
+
+    if 'game_id' in d.columns:
+        d = d.drop(columns=['game_id'])
+
+    if 'GAME_ID' in d.columns:
+        d['GAME_ID'] = d['GAME_ID'].astype('string')
+
+    if 'TEAM_ID' in d.columns:
+        d['TEAM_ID'] = pd.to_numeric(d['TEAM_ID'], errors='coerce')
+        d = d[d['TEAM_ID'].notna()].copy()
+        d['TEAM_ID'] = d['TEAM_ID'].astype('int64')
+
+    if require_player and 'PLAYER_ID' in d.columns:
+        d['PLAYER_ID'] = pd.to_numeric(d['PLAYER_ID'], errors='coerce')
+        d = d[d['PLAYER_ID'].notna()].copy()
+        d['PLAYER_ID'] = d['PLAYER_ID'].astype('int64')
+
+    if require_player and 'PLAYER_ID' not in d.columns:
+        raise ValueError('Se requiere PLAYER_ID para esta operación de lineups.')
+
+    return d
+
+
+def _coerce_minutes_series(df: pd.DataFrame, candidates: Sequence[str]) -> pd.Series:
+    """Devuelve una serie de minutos como float a partir de columnas conocidas."""
+
+    for cand in candidates:
+        if cand in df.columns:
+            series = df[cand]
+            break
+    else:
+        return pd.Series(0.0, index=df.index, dtype=float)
+
+    def _parse_minutes(value) -> float:
+        if pd.isna(value):
+            return 0.0
+        if isinstance(value, (int, float, np.number)):
+            return float(value)
+        text = str(value).strip()
+        if not text:
+            return 0.0
+        if text.count(':') == 1:
+            minutes, seconds = text.split(':')
+            try:
+                return float(minutes) + float(seconds) / 60.0
+            except ValueError:
+                pass
+        numeric_val = pd.to_numeric(text, errors='coerce')
+        if pd.isna(numeric_val):
+            return 0.0
+        return float(numeric_val)
+
+    return series.apply(_parse_minutes).astype(float)
+
+
+def _winsorize(values: Sequence[float], limits: Tuple[float, float]) -> np.ndarray:
+    arr = np.asarray(values, dtype=float)
+    if arr.size == 0:
+        return arr
+
+    lower_q, upper_q = limits
+    lower_q = max(0.0, min(0.5, lower_q))
+    upper_q = max(0.5, min(1.0, upper_q))
+
+    if arr.size == 1:
+        lower_val = upper_val = arr[0]
+    else:
+        lower_val = np.nanquantile(arr, lower_q)
+        upper_val = np.nanquantile(arr, upper_q)
+
+    return np.clip(arr, lower_val, upper_val)
+
+
+def extract_game_lineups_from_boxscore(df_box: pd.DataFrame) -> pd.DataFrame:
+    """Devuelve alineaciones por partido usando titulares o top-5 por minutos."""
+
+    required_cols = {'GAME_ID', 'TEAM_ID', 'PLAYER_ID'}
+    if not required_cols.issubset(df_box.columns):
+        raise ValueError(f'Faltan columnas necesarias en boxscore: {required_cols - set(df_box.columns)}')
+
+    d = _cast_ids_for_lineup(df_box, require_player=True)
+    d['_MINUTES_'] = _coerce_minutes_series(d, ('MIN', 'MIN__sum', 'MINUTES', 'MIN_SUM'))
+    if 'PTS' not in d.columns:
+        d['PTS'] = 0.0
+    d['PTS'] = pd.to_numeric(d['PTS'], errors='coerce').fillna(0.0)
+    if 'USG_PCT' not in d.columns:
+        d['USG_PCT'] = 0.0
+    d['USG_PCT'] = pd.to_numeric(d['USG_PCT'], errors='coerce').fillna(0.0)
+
+    records: List[Dict[str, object]] = []
+
+    valid_starter_positions = {'C', 'F', 'G', 'F-C', 'F-G', 'G-F', 'C-F', 'C-G'}
+
+    for (game_id, team_id), group in d.groupby(['GAME_ID', 'TEAM_ID'], sort=False):
+        lineup_source = 'starters'
+        starters = group[group['START_POSITION'].astype(str).str.strip().isin(valid_starter_positions)]
+        starters_ids = list(dict.fromkeys(starters['PLAYER_ID'].tolist()))
+
+        if len(starters_ids) != 5:
+            lineup_source = 'top5_min'
+            print(
+                f"⚠️ Titulares incompletos ({len(starters_ids)}) para GAME_ID={game_id}, TEAM_ID={team_id}. "
+                "Uso top-5 por minutos."
+            )
+            ordered = group.sort_values(
+                by=['_MINUTES_', 'PTS', 'USG_PCT'], ascending=[False, False, False]
+            )
+            starters_ids = list(dict.fromkeys(ordered['PLAYER_ID'].tolist()))[:5]
+
+        if len(starters_ids) < 5:
+            print(
+                f"⚠️ Solo {len(starters_ids)} jugadores disponibles para GAME_ID={game_id}, TEAM_ID={team_id}."
+            )
+
+        players_sorted = sorted({int(pid) for pid in starters_ids})
+        lineup_id = build_lineup_id(players_sorted)
+        records.append(
+            {
+                'GAME_ID': game_id,
+                'TEAM_ID': team_id,
+                'players': players_sorted,
+                'lineup_id': lineup_id,
+                'lineup_source': lineup_source,
+            }
+        )
+
+    return pd.DataFrame.from_records(records)
+
+
+def compute_player_quality_from_onoff(
+    df_on: pd.DataFrame,
+    df_off: pd.DataFrame,
+    m0_player_minutes: int = 400,
+    winsor_limits: Tuple[float, float] = (0.05, 0.95),
+) -> pd.DataFrame:
+    """Calcula impacto on/off con shrinkage por minutos."""
+
+    if m0_player_minutes <= 0:
+        raise ValueError('m0_player_minutes debe ser positivo.')
+
+    on = _cast_ids_for_lineup(df_on, require_player=True)
+    off = _cast_ids_for_lineup(df_off, require_player=True)
+
+    on['minutes_on'] = _coerce_minutes_series(on, ('MIN', 'MIN__sum', 'MINUTES', 'MIN_SUM'))
+    net_on_col = _find_column_case_insensitive(on.columns, 'NET_RATING')
+    net_off_col = _find_column_case_insensitive(off.columns, 'NET_RATING')
+    if net_on_col is None or net_off_col is None:
+        raise ValueError('No se encontraron columnas NET_RATING en on/off.')
+
+    on['NET_RATING_on'] = pd.to_numeric(on[net_on_col], errors='coerce').fillna(0.0)
+    off['NET_RATING_off'] = pd.to_numeric(off[net_off_col], errors='coerce').fillna(0.0)
+
+    merged = on[['TEAM_ID', 'PLAYER_ID', 'NET_RATING_on', 'minutes_on']].merge(
+        off[['TEAM_ID', 'PLAYER_ID', 'NET_RATING_off']], how='left', on=['TEAM_ID', 'PLAYER_ID']
+    )
+    merged['NET_RATING_off'] = merged['NET_RATING_off'].fillna(0.0)
+    merged['impact_raw'] = merged['NET_RATING_on'] - merged['NET_RATING_off']
+
+    team_means = (
+        merged.groupby('TEAM_ID')['impact_raw'].mean().replace([np.inf, -np.inf], np.nan).fillna(0.0)
+    )
+    merged['team_mean'] = merged['TEAM_ID'].map(team_means).fillna(0.0)
+
+    merged['minutes_on'] = merged['minutes_on'].fillna(0.0)
+    merged['weight'] = merged['minutes_on'] / (merged['minutes_on'] + float(m0_player_minutes))
+    merged['quality_player'] = (
+        merged['weight'] * merged['impact_raw'] + (1.0 - merged['weight']) * merged['team_mean']
+    )
+
+    low_weight = merged[merged['weight'] < 0.25]
+    if not low_weight.empty:
+        sample_players = low_weight.head(5)['PLAYER_ID'].tolist()
+        print(
+            f"⚠️ Shrink fuerte para {len(low_weight)} jugadores (w<0.25). Ejemplos: {sample_players}."
+        )
+
+    result = merged[['TEAM_ID', 'PLAYER_ID', 'impact_raw', 'minutes_on', 'quality_player']].copy()
+    result.attrs['winsor_limits'] = winsor_limits
+    result.attrs['m0_player_minutes'] = m0_player_minutes
+
+    return result
+
+
+def compute_lineup_synergy_from_dashboard(
+    df_lineups: pd.DataFrame,
+    M0_lineup_minutes: int = 300,
+) -> pd.DataFrame:
+    """Calcula la sinergia bayesiana de las alineaciones históricas usando PLUS_MINUS."""
+
+    if M0_lineup_minutes <= 0:
+        raise ValueError('M0_lineup_minutes debe ser positivo.')
+
+    d = _cast_ids_for_lineup(df_lineups)
+    if 'GROUP_ID' not in d.columns:
+        raise ValueError('El dataframe de lineups debe contener GROUP_ID.')
+
+    d['GROUP_ID'] = d['GROUP_ID'].astype('string')
+    d['minutes_lineup'] = _coerce_minutes_series(d, ('MIN', 'MIN__sum', 'MINUTES', 'MIN_SUM'))
+
+    plus_minus_col = 'PLUS_MINUS'
+    if plus_minus_col not in d.columns:
+        raise ValueError(f'No se encontró columna {plus_minus_col} en el dashboard de lineups.')
+
+    d['plus_minus_lineup'] = pd.to_numeric(d[plus_minus_col], errors='coerce').fillna(0.0)
+
+    team_minutes = d.groupby('TEAM_ID')['minutes_lineup'].sum()
+    team_weighted_plus_minus = d.groupby('TEAM_ID').apply(
+        lambda x: np.average(
+            x['plus_minus_lineup'],
+            weights=np.clip(x['minutes_lineup'], 1e-6, None),
+        )
+        if (x['minutes_lineup'] > 0).any()
+        else 0.0
+    )
+    plus_minus_team = team_weighted_plus_minus.reindex(team_minutes.index).fillna(0.0)
+
+    d['plus_minus_team'] = d['TEAM_ID'].map(plus_minus_team).fillna(0.0)
+    d['weight'] = d['minutes_lineup'] / (d['minutes_lineup'] + float(M0_lineup_minutes))
+    d['synergy'] = d['weight'] * d['plus_minus_lineup'] + (1.0 - d['weight']) * d['plus_minus_team']
+
+    result = d[
+        ['TEAM_ID', 'GROUP_ID', 'synergy', 'minutes_lineup', 'plus_minus_lineup', 'plus_minus_team']
+    ].copy()
+    result.attrs['M0_lineup_minutes'] = M0_lineup_minutes
+
+    return result
+
+
+def score_game_lineups(
+    df_game_lineups: pd.DataFrame,
+    df_quality_players: pd.DataFrame,
+    df_synergy: pd.DataFrame,
+    alpha_quality: float = 0.75,
+) -> pd.DataFrame:
+    """Une quality + synergy para puntuar alineaciones por partido."""
+
+    if not 0 <= alpha_quality <= 1:
+        raise ValueError('alpha_quality debe estar entre 0 y 1.')
+
+    game_lineups = _cast_ids_for_lineup(df_game_lineups)
+    quality = _cast_ids_for_lineup(df_quality_players, require_player=True)
+    synergy = _cast_ids_for_lineup(df_synergy)
+    if 'GROUP_ID' in synergy.columns:
+        synergy['GROUP_ID'] = synergy['GROUP_ID'].astype('string')
+
+    winsor_limits = df_quality_players.attrs.get('winsor_limits', (0.05, 0.95))
+
+    quality_lookup = quality.set_index(['TEAM_ID', 'PLAYER_ID'])['quality_player']
+    team_fallback = (
+        quality.groupby('TEAM_ID')['quality_player'].mean().replace([np.inf, -np.inf], np.nan).fillna(0.0)
+    )
+
+    synergy_lookup = synergy.set_index(['TEAM_ID', 'GROUP_ID'])
+    team_synergy = synergy.groupby('TEAM_ID')['plus_minus_team'].mean().fillna(0.0)
+
+    scored_records: List[Dict[str, object]] = []
+
+    for _, row in game_lineups.iterrows():
+        team_id = row['TEAM_ID']
+        lineup_id = str(row['lineup_id'])
+        raw_players = row.get('players', [])
+        if isinstance(raw_players, str):
+            raw_players = [int(p) for p in re.findall(r'-?\d+', raw_players)]
+        elif isinstance(raw_players, (set, tuple, list, np.ndarray, pd.Series)):
+            raw_players = list(raw_players)
+        elif pd.isna(raw_players):
+            raw_players = []
+        else:
+            raw_players = [raw_players]
+        players_list = [int(p) for p in raw_players if not pd.isna(p)]
+
+        player_qualities: List[float] = []
+        for pid in players_list:
+            key = (team_id, int(pid))
+            if key in quality_lookup.index:
+                player_qualities.append(float(quality_lookup.loc[key]))
+            else:
+                fallback = float(team_fallback.get(team_id, 0.0))
+                player_qualities.append(fallback)
+
+        if len(players_list) != 5:
+            print(
+                f"⚠️ Esperaba 5 jugadores para TEAM_ID={team_id}, GAME_ID={row['GAME_ID']}. "
+                f"Recibí {len(players_list)}."
+            )
+
+        winsorized = _winsorize(player_qualities, winsor_limits)
+        lineup_quality = float(np.nanmean(winsorized)) if winsorized.size else 0.0
+
+        minutes_hist = 0.0
+        lineup_synergy = float(team_synergy.get(team_id, 0.0))
+        plus_minus_lineup = np.nan
+        if (team_id, lineup_id) in synergy_lookup.index:
+            match_row = synergy_lookup.loc[(team_id, lineup_id)]
+            minutes_hist = float(match_row.get('minutes_lineup', 0.0))
+            lineup_synergy = float(match_row.get('synergy', lineup_synergy))
+            plus_minus_lineup = float(match_row.get('plus_minus_lineup', np.nan))
+        else:
+            print(
+                f"⚠️ Alineación {lineup_id} no encontrada para TEAM_ID={team_id}. "
+                "Uso plus_minus_team como fallback."
+            )
+
+        lineup_score = alpha_quality * lineup_quality + (1.0 - alpha_quality) * lineup_synergy
+
+        scored_records.append(
+            {
+                'GAME_ID': row['GAME_ID'],
+                'TEAM_ID': team_id,
+                'lineup_id': lineup_id,
+                'players': players_list,
+                'lineup_source': row.get('lineup_source', 'unknown'),
+                'lineup_quality': lineup_quality,
+                'lineup_synergy': lineup_synergy,
+                'lineup_score': lineup_score,
+                'minutes_hist': minutes_hist,
+                'plus_minus_lineup_hist': plus_minus_lineup,
+            }
+        )
+
+    return pd.DataFrame.from_records(scored_records)
+
+
+def build_lineup_scores_for_games(
+    df_box: pd.DataFrame,
+    df_lineups: pd.DataFrame,
+    df_on: pd.DataFrame,
+    df_off: pd.DataFrame,
+    params: dict | None = None,
+) -> pd.DataFrame:
+    """Orquesta la construcción de LINEUP_SCORE_DIFF a nivel partido."""
+
+    params = params or {}
+    m0_player_minutes = int(params.get('m0_player_minutes', 400))
+    M0_lineup_minutes = int(params.get('M0_lineup_minutes', 300))
+    alpha_quality = float(params.get('alpha_quality', 0.75))
+    winsor_limits = tuple(params.get('winsor_limits', (0.05, 0.95)))
+
+    box = _cast_ids_for_lineup(df_box, require_player=True)
+
+    required_cols = ['GAME_ID', 'TEAM_ID']
+    missing_cols = [col for col in required_cols if col not in box.columns]
+    if missing_cols:
+        raise ValueError(
+            f"Se necesitan las columnas {missing_cols} para identificar equipos por juego."
+        )
+
+    game_lineups = extract_game_lineups_from_boxscore(box)
+    quality_players = compute_player_quality_from_onoff(
+        df_on, df_off, m0_player_minutes=m0_player_minutes, winsor_limits=winsor_limits
+    )
+    quality_players.attrs['winsor_limits'] = winsor_limits
+    synergy = compute_lineup_synergy_from_dashboard(df_lineups, M0_lineup_minutes=M0_lineup_minutes)
+
+    scored = score_game_lineups(
+        game_lineups,
+        quality_players,
+        synergy,
+        alpha_quality=alpha_quality,
+    )
+
+    meta = box[['GAME_ID', 'TEAM_ID']].drop_duplicates()
+
+    team_counts = meta.groupby('GAME_ID')['TEAM_ID'].nunique()
+    invalid_games = team_counts[team_counts != 2]
+    if not invalid_games.empty:
+        sample = invalid_games.index.tolist()[:5]
+        raise ValueError(
+            'Cada GAME_ID debe tener exactamente 2 TEAM_ID distintos. '
+            f'Problemas detectados en: {sample}'
+        )
+
+    meta_scored = meta.merge(
+        scored,
+        on=['GAME_ID', 'TEAM_ID'],
+        how='left',
+        suffixes=('', '_scored'),
+    )
+
+    meta_scored = meta_scored.sort_values(['GAME_ID', 'TEAM_ID']).reset_index(drop=True)
+    meta_scored['TEAM_ORDER'] = meta_scored.groupby('GAME_ID').cumcount()
+
+    if meta_scored['TEAM_ORDER'].max() != 1:
+        raise ValueError('No se pudieron asignar exactamente dos equipos por GAME_ID.')
+
+    home = (
+        meta_scored[meta_scored['TEAM_ORDER'] == 0]
+        .drop(columns='TEAM_ORDER')
+        .add_prefix('home_')
+    )
+    away = (
+        meta_scored[meta_scored['TEAM_ORDER'] == 1]
+        .drop(columns='TEAM_ORDER')
+        .add_prefix('away_')
+    )
+
+    combined = pd.merge(
+        home,
+        away,
+        left_on='home_GAME_ID',
+        right_on='away_GAME_ID',
+        how='inner',
+        suffixes=('_home', '_away'),
+    )
+
+    combined['LINEUP_SCORE_DIFF'] = combined['home_lineup_score'] - combined['away_lineup_score']
+
+    result = combined[
+        [
+            'home_GAME_ID',
+            'home_TEAM_ID',
+            'away_TEAM_ID',
+            'home_lineup_score',
+            'away_lineup_score',
+            'LINEUP_SCORE_DIFF',
+            'home_lineup_quality',
+            'away_lineup_quality',
+            'home_lineup_synergy',
+            'away_lineup_synergy',
+            'home_minutes_hist',
+            'away_minutes_hist',
+            'home_lineup_id',
+            'away_lineup_id',
+            'home_players',
+            'away_players',
+        ]
+    ].copy()
+
+    result = result.rename(
+        columns={
+            'home_GAME_ID': 'GAME_ID',
+            'home_TEAM_ID': 'HOME_TEAM_ID',
+            'away_TEAM_ID': 'AWAY_TEAM_ID',
+        }
+    )
+
+    result['GAME_ID'] = result['GAME_ID'].astype('string')
+    result['HOME_TEAM_ID'] = pd.to_numeric(result['HOME_TEAM_ID'], errors='coerce').astype('int64')
+    result['AWAY_TEAM_ID'] = pd.to_numeric(result['AWAY_TEAM_ID'], errors='coerce').astype('int64')
+
+    return result
 
 
 def _infer_datetime_column(df: pd.DataFrame, *, min_valid_ratio: float = 0.6) -> str | None:
@@ -642,6 +1118,7 @@ def build_match_dataset_enhanced(
     df: pd.DataFrame,
     numeric_feature_prefixes: Sequence[str] = ("ROLL10_", "VENUE_"),
     advanced_features: Optional[Sequence[str]] = None,
+    lineup_scores: Optional[pd.DataFrame] = None,
 ) -> Tuple[pd.DataFrame, np.ndarray, pd.DataFrame]:
     """Builds the home/away match-level dataset with differential features."""
     d = df.copy()
@@ -655,6 +1132,53 @@ def build_match_dataset_enhanced(
         left_on='HOME_GAME_ID', right_on='AWAY_GAME_ID',
         how='inner',
     )
+
+    if lineup_scores is not None:
+        try:
+            lineup_df = lineup_scores.copy()
+            if 'GAME_ID' not in lineup_df.columns:
+                raise ValueError('lineup_scores necesita columna GAME_ID')
+            rename_map = {
+                'GAME_ID': 'LINEUP_GAME_ID',
+                'home_lineup_score': 'HOME_LINEUP_SCORE',
+                'away_lineup_score': 'AWAY_LINEUP_SCORE',
+                'home_lineup_quality': 'HOME_LINEUP_QUALITY',
+                'away_lineup_quality': 'AWAY_LINEUP_QUALITY',
+                'home_lineup_synergy': 'HOME_LINEUP_SYNERGY',
+                'away_lineup_synergy': 'AWAY_LINEUP_SYNERGY',
+                'home_minutes_hist': 'HOME_LINEUP_MINUTES_HIST',
+                'away_minutes_hist': 'AWAY_LINEUP_MINUTES_HIST',
+                'home_lineup_id': 'HOME_LINEUP_ID',
+                'away_lineup_id': 'AWAY_LINEUP_ID',
+                'home_players': 'HOME_PLAYERS',
+                'away_players': 'AWAY_PLAYERS',
+            }
+            lineup_df = lineup_df.rename(columns={k: v for k, v in rename_map.items() if k in lineup_df.columns})
+            lineup_df['LINEUP_GAME_ID'] = lineup_df['LINEUP_GAME_ID'].astype('string')
+            merged['HOME_GAME_ID'] = merged['HOME_GAME_ID'].astype('string')
+            merged = merged.merge(
+                lineup_df,
+                left_on='HOME_GAME_ID',
+                right_on='LINEUP_GAME_ID',
+                how='left',
+                suffixes=('', '_LINEUP'),
+            )
+            merged = merged.drop(columns=[c for c in ['LINEUP_GAME_ID'] if c in merged.columns])
+            for col in [
+                'HOME_LINEUP_SCORE',
+                'AWAY_LINEUP_SCORE',
+                'HOME_LINEUP_QUALITY',
+                'AWAY_LINEUP_QUALITY',
+                'HOME_LINEUP_SYNERGY',
+                'AWAY_LINEUP_SYNERGY',
+                'HOME_LINEUP_MINUTES_HIST',
+                'AWAY_LINEUP_MINUTES_HIST',
+            ]:
+                if col in merged.columns:
+                    merged[col] = pd.to_numeric(merged[col], errors='coerce')
+        except Exception as exc:
+            print(f"Omito lineup score: {exc}")
+
 
     merged['y'] = (merged['HOME_WL'].astype(str).str.upper().str.strip() == 'W').astype(int)
 
@@ -675,6 +1199,9 @@ def build_match_dataset_enhanced(
             X_rel[f'DIFF_{base}'] = merged[h] - merged[a]
 
     X_rel['HOME_COURT'] = 1
+
+    if 'LINEUP_SCORE_DIFF' in merged.columns:
+        X_rel['LINEUP_SCORE_DIFF'] = pd.to_numeric(merged['LINEUP_SCORE_DIFF'], errors='coerce')
 
     if 'HOME_VENUE_HOME_W_PCT' in merged.columns and 'AWAY_VENUE_ROAD_W_PCT' in merged.columns:
         X_rel['DIFF_VENUE_W_PCT'] = merged['HOME_VENUE_HOME_W_PCT'] - merged['AWAY_VENUE_ROAD_W_PCT']
@@ -718,10 +1245,27 @@ def build_match_dataset_enhanced(
     ]
     aux_cols = [c for c in aux_cols if c in merged.columns]
     meta = merged[aux_cols].copy()
+    for col in [
+        'LINEUP_SCORE_DIFF',
+        'HOME_LINEUP_SCORE',
+        'AWAY_LINEUP_SCORE',
+        'HOME_LINEUP_QUALITY',
+        'AWAY_LINEUP_QUALITY',
+        'HOME_LINEUP_SYNERGY',
+        'AWAY_LINEUP_SYNERGY',
+        'HOME_LINEUP_ID',
+        'AWAY_LINEUP_ID',
+        'HOME_PLAYERS',
+        'AWAY_PLAYERS',
+        'HOME_LINEUP_MINUTES_HIST',
+        'AWAY_LINEUP_MINUTES_HIST',
+    ]:
+        if col in merged.columns:
+            meta[col] = merged[col]
     for col_name, series in extra_meta.items():
         meta[col_name] = series.values
 
-    allowed_exact = {'HOME_COURT', 'DIFF_DAYS_REST', 'DIFF_LAST_5_PCT', 'DIFF_B2B_FLAG'}
+    allowed_exact = {'HOME_COURT', 'DIFF_DAYS_REST', 'DIFF_LAST_5_PCT', 'DIFF_B2B_FLAG', 'LINEUP_SCORE_DIFF'}
     allowed_prefixes = list(numeric_feature_prefixes) + ['HOME_COURT', 'DIFF_']
 
     for col in X_rel.columns:
