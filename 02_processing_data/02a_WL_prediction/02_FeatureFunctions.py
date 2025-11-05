@@ -7,7 +7,7 @@ from __future__ import annotations
 import logging
 import re
 from pathlib import Path
-from typing import Dict, List, Optional, Sequence, Tuple
+from typing import Dict, Iterable, List, Optional, Sequence, Tuple
 
 import numpy as np
 import pandas as pd
@@ -41,13 +41,22 @@ logger = logging.getLogger(__name__)
 __all__ = [
     'DEFAULT_DAYS_REST',
     'ensure_teamid_and_date',
+    'features_baseline',
     'features_roll10',
+    'features_venue',
+    'features_enhanced',
+    'features_lineup',
+    'add_calendar_no_leak',
+    'add_elo_no_leak',
+    'build_match_level',
+    'impute_roll10_inplace',
+    'impute_advanced_inplace',
+    'impute_calendar_inplace',
+    'impute_match_differentials_inplace',
     'parse_days_rest_value',
     'load_days_rest_reference',
     'add_days_rest_from_reference',
     'calculate_current_streak',
-    'features_enhanced',
-    'features_venue',
     'build_match_dataset_enhanced',
     'fit_and_eval',
     'build_lineup_id',
@@ -145,6 +154,44 @@ def features_roll10(df: pd.DataFrame) -> pd.DataFrame:
 
 
 # =========================
+# Baseline (ROLL10) block
+# =========================
+def features_baseline(df: pd.DataFrame) -> pd.DataFrame:
+    """Preserva identificadores y asegura limpieza básica de métricas ROLL10_."""
+
+    df = ensure_teamid_and_date(df)
+
+    required_ids = [
+        'TEAM_ID',
+        'TEAM_ABBREVIATION',
+        'GAME_ID',
+        'GAME_DATE',
+        'MATCHUP',
+        'WL',
+        'WL_NUM',
+    ]
+
+    missing_ids = [col for col in required_ids if col not in df.columns]
+    if missing_ids:
+        raise ValueError(f"Faltan columnas obligatorias para baseline: {missing_ids}")
+
+    roll_cols = sorted([c for c in df.columns if c.startswith('ROLL10_')])
+    if not roll_cols:
+        raise ValueError('No se encontraron columnas con prefijo ROLL10_.')
+
+    for col in roll_cols:
+        df[col] = pd.to_numeric(df[col], errors='coerce')
+
+    df['WL_NUM'] = pd.to_numeric(df['WL_NUM'], errors='coerce')
+
+    df = df.sort_values(['TEAM_ID', 'GAME_DATE']).reset_index(drop=True)
+
+    impute_roll10_inplace(df, roll_cols)
+
+    return df
+
+
+# =========================
 # Days Rest utilities
 # =========================
 def parse_days_rest_value(value):
@@ -207,6 +254,197 @@ def _find_column_case_insensitive(columns: pd.Index, *aliases: str) -> str | Non
         if cand_lower in lower_map:
             return lower_map[cand_lower]
     return None
+
+
+# =========================
+# Lineup (static team block)
+# =========================
+def features_lineup(
+    df: pd.DataFrame,
+    lineup_path: str | Path = "/Users/pablo/Documents/BigData/BasketballAnalysis/00_data/00c_final/2024-25/dashboards/team_dash_lineups__dataset_1.parquet",
+) -> pd.DataFrame:
+    """Añade métricas estáticas de lineups por equipo si existe el parquet indicado."""
+
+    df = ensure_teamid_and_date(df)
+
+    lineup_path = Path(lineup_path)
+    if not lineup_path.exists():
+        print(f"⚠️ Archivo de lineups no encontrado ({lineup_path}). Se omite merge.")
+        return df
+
+    try:
+        lineups = pd.read_parquet(lineup_path).copy()
+    except Exception as exc:  # pragma: no cover - robustez en entorno productivo
+        print(f"⚠️ No se pudo leer el parquet de lineups: {exc}. Se omite merge.")
+        return df
+
+    if lineups.empty:
+        print("⚠️ Parquet de lineups vacío. Se omite merge.")
+        return df
+
+    lineups.columns = [str(c).strip() for c in lineups.columns]
+
+    team_col = _find_column_case_insensitive(lineups.columns, 'TEAM_ID', 'TEAMID')
+    if team_col is None:
+        print("⚠️ No se encontró columna TEAM_ID en el parquet de lineups. Se omite merge.")
+        return df
+
+    lineups['_TEAM_ID_TMP'] = pd.to_numeric(
+        lineups[team_col].map(_flatten_scalar), errors='coerce'
+    )
+    lineups = lineups[lineups['_TEAM_ID_TMP'].notna()].copy()
+    if lineups.empty:
+        print("⚠️ No hay registros de lineups válidos tras limpiar TEAM_ID. Se omite merge.")
+        return df
+
+    expected_columns: Dict[str, Tuple[str, ...]] = {
+        'LINEUP_WEIGHTED_NET': ('LINEUP_WEIGHTED_NET', 'WEIGHTED_NET_RATING'),
+        'LINEUP_TOP5_NET': ('LINEUP_TOP5_NET', 'TOP5_NET_RATING'),
+        'LINEUP_TOP5_MIN': ('LINEUP_TOP5_MIN', 'TOP5_MINUTES'),
+        'LINEUP_STABILITY_HHI': ('LINEUP_STABILITY_HHI', 'LINEUP_HHI'),
+        'LINEUP_VARIETY_5MIN': ('LINEUP_VARIETY_5MIN', 'LINEUP_VARIETY_5MIN'),
+        'LINEUP_TOTAL_MIN': ('LINEUP_TOTAL_MIN', 'TOTAL_MINUTES'),
+    }
+
+    extracted = {'TEAM_ID': lineups['_TEAM_ID_TMP'].astype('int64')}
+    for target, aliases in expected_columns.items():
+        col_name = _find_column_case_insensitive(lineups.columns, *aliases)
+        if col_name is None:
+            extracted[target] = pd.Series(np.nan, index=lineups.index, dtype=float)
+            continue
+        extracted[target] = pd.to_numeric(lineups[col_name], errors='coerce')
+
+    features_df = pd.DataFrame(extracted)
+    aggregated = (
+        features_df.groupby('TEAM_ID', as_index=False)
+        .median(numeric_only=True)
+        .rename(columns={'TEAM_ID': '_TEAM_ID_AGG'})
+    )
+    aggregated['_TEAM_KEY'] = _to_key_str(aggregated['_TEAM_ID_AGG'])
+
+    df['_TEAM_KEY'] = _to_key_str(df['TEAM_ID'])
+    before_shape = df.shape
+
+    merge_cols = ['_TEAM_KEY'] + [c for c in expected_columns if c in aggregated.columns]
+    df = df.merge(aggregated[merge_cols], on='_TEAM_KEY', how='left')
+
+    df = df.drop(columns=['_TEAM_KEY'], errors='ignore')
+
+    added_cols = [c for c in expected_columns if c in df.columns]
+    impute_map: Dict[str, float] = {}
+    for col in added_cols:
+        df[col] = pd.to_numeric(df[col], errors='coerce')
+        if df[col].isna().all():
+            df[col] = 0.0
+            impute_map[col] = 0.0
+            continue
+        median_val = df[col].median()
+        if pd.isna(median_val):
+            median_val = 0.0
+        df[col] = df[col].fillna(float(median_val))
+        impute_map[col] = float(median_val)
+
+    print(
+        "OK LINEUP: métricas estáticas añadidas"
+        f" ({before_shape} -> {df.shape}). Columnas: {added_cols}"
+    )
+    if impute_map:
+        print("Imputaciones LINEUP aplicadas:", impute_map)
+
+    return df
+
+
+# =========================
+# Imputaciones auxiliares
+# =========================
+def impute_roll10_inplace(df: pd.DataFrame, columns: Optional[Iterable[str]] = None) -> pd.DataFrame:
+    """Imputa columnas ROLL10_ con la mediana (0.0 si no existe)."""
+
+    if columns is None:
+        columns = [c for c in df.columns if c.startswith('ROLL10_')]
+
+    for col in columns:
+        if col not in df.columns:
+            continue
+        df[col] = pd.to_numeric(df[col], errors='coerce')
+        if df[col].isna().all():
+            df[col] = 0.0
+            continue
+        median_val = df[col].median()
+        if pd.isna(median_val):
+            median_val = 0.0
+        df[col] = df[col].fillna(float(median_val))
+
+    return df
+
+
+def impute_advanced_inplace(df: pd.DataFrame) -> pd.DataFrame:
+    """Imputa columnas avanzadas calculadas en features_enhanced."""
+
+    defaults = {
+        'WIN_STREAK': 0.0,
+        'LAST_5_PCT': 0.5,
+        'DAYS_REST': DEFAULT_DAYS_REST,
+        'SEASON_W_PCT': 0.5,
+        'TURNOVER_RATIO': 0.0,
+    }
+
+    if 'PACE' in df.columns:
+        df['PACE'] = pd.to_numeric(df['PACE'], errors='coerce')
+        pace_median = df['PACE'].median()
+        if pd.isna(pace_median):
+            pace_median = 0.0
+        df['PACE'] = df['PACE'].fillna(float(pace_median))
+
+    for col, default_val in defaults.items():
+        if col not in df.columns:
+            continue
+        df[col] = pd.to_numeric(df[col], errors='coerce')
+        df[col] = df[col].fillna(float(default_val))
+
+    return df
+
+
+def impute_calendar_inplace(df: pd.DataFrame) -> pd.DataFrame:
+    """Imputa métricas de calendario para evitar fugas."""
+
+    calendar_defaults = {
+        'DAYS_REST_CALC': DEFAULT_DAYS_REST,
+        'IS_B2B_CALC': 0.0,
+        'GAMES_IN_3D_CALC': 0.0,
+        'GAMES_IN_5D_CALC': 0.0,
+        'GAMES_IN_7D_CALC': 0.0,
+    }
+
+    for col, default_val in calendar_defaults.items():
+        if col not in df.columns:
+            continue
+        df[col] = pd.to_numeric(df[col], errors='coerce')
+        df[col] = df[col].fillna(float(default_val))
+
+    return df
+
+
+def impute_match_differentials_inplace(df: pd.DataFrame) -> pd.DataFrame:
+    """Imputa diferenciales de partido y asegura HOME_COURT y P_ELO_HOME válidos."""
+
+    diff_cols = [c for c in df.columns if c.startswith('DIFF_')]
+    for col in diff_cols:
+        df[col] = pd.to_numeric(df[col], errors='coerce')
+        df[col] = df[col].fillna(0.0)
+
+    if 'P_ELO_HOME' in df.columns:
+        df['P_ELO_HOME'] = pd.to_numeric(df['P_ELO_HOME'], errors='coerce')
+        df['P_ELO_HOME'] = df['P_ELO_HOME'].clip(lower=0.0, upper=1.0)
+        df['P_ELO_HOME'] = df['P_ELO_HOME'].fillna(0.5)
+
+    if 'HOME_COURT' in df.columns:
+        df['HOME_COURT'] = 1
+
+    if 'LINEUP_SCORE_DIFF' in df.columns:
+        df['LINEUP_SCORE_DIFF'] = pd.to_numeric(df['LINEUP_SCORE_DIFF'], errors='coerce')
+
+    return df
 
 
 # =========================
@@ -1109,6 +1347,364 @@ def features_venue(
         print("Imputaciones aplicadas:", imput)
 
     return df
+
+
+# =========================
+# Calendario sin fuga
+# =========================
+def add_calendar_no_leak(df: pd.DataFrame) -> pd.DataFrame:
+    """Calcula métricas retrospectivas de calendario evitando fuga de información."""
+
+    df = ensure_teamid_and_date(df)
+
+    if 'TEAM_ID' not in df.columns or 'GAME_DATE' not in df.columns:
+        raise ValueError('TEAM_ID y GAME_DATE son necesarios para calcular calendario.')
+
+    calendar_cols = [
+        'DAYS_REST_CALC',
+        'IS_B2B_CALC',
+        'GAMES_IN_3D_CALC',
+        'GAMES_IN_5D_CALC',
+        'GAMES_IN_7D_CALC',
+    ]
+
+    df = df.drop(columns=[c for c in calendar_cols if c in df.columns])
+
+    df = df.sort_values(['TEAM_ID', 'GAME_DATE']).reset_index(drop=True)
+
+    updates: List[pd.DataFrame] = []
+    for _, group in df.groupby('TEAM_ID', sort=False):
+        g = group.sort_values('GAME_DATE').reset_index()
+        dates = g['GAME_DATE'].values.astype('datetime64[D]')
+        ordinals = dates.astype('int64')
+
+        diff_days = g['GAME_DATE'].diff().dt.days
+        rest_raw = diff_days - 1
+        rest_vals = rest_raw.fillna(DEFAULT_DAYS_REST).clip(lower=0)
+        b2b_flag = rest_raw.fillna(DEFAULT_DAYS_REST).le(0).astype(int)
+
+        idx = np.arange(len(ordinals))
+        counts = {}
+        for window in (3, 5, 7):
+            lower_bounds = ordinals - window
+            start_idx = np.searchsorted(ordinals, lower_bounds, side='left')
+            counts[window] = (idx - start_idx).clip(min=0)
+
+        updates.append(
+            pd.DataFrame(
+                {
+                    'index': g['index'],
+                    'DAYS_REST_CALC': rest_vals.astype(int),
+                    'IS_B2B_CALC': b2b_flag.astype(int),
+                    'GAMES_IN_3D_CALC': counts[3],
+                    'GAMES_IN_5D_CALC': counts[5],
+                    'GAMES_IN_7D_CALC': counts[7],
+                }
+            )
+        )
+
+    if updates:
+        merged = pd.concat(updates, ignore_index=True).set_index('index')
+        for col in calendar_cols:
+            df.loc[merged.index, col] = merged[col].values
+
+    impute_calendar_inplace(df)
+
+    print("OK: Calendario sin fuga calculado (DAYS_REST_CALC, IS_B2B_CALC, ventanas de 3/5/7 días).")
+
+    return df
+
+
+# =========================
+# Elo sin fuga
+# =========================
+def add_elo_no_leak(
+    df: pd.DataFrame,
+    *,
+    base_rating: float = 1500.0,
+    k_factor: float = 20.0,
+    home_advantage: float = 65.0,
+    carry_over: float = 0.75,
+) -> pd.DataFrame:
+    """Calcula Elo pre-partido y probabilidades sin fuga de información."""
+
+    df = ensure_teamid_and_date(df)
+
+    required_cols = {'TEAM_ID', 'GAME_ID', 'GAME_DATE', 'MATCHUP', 'WL_NUM'}
+    missing = required_cols - set(df.columns)
+    if missing:
+        raise ValueError(f"Faltan columnas necesarias para Elo: {sorted(missing)}")
+
+    df = df.sort_values(['GAME_DATE', 'GAME_ID', 'TEAM_ID']).reset_index(drop=True)
+
+    season_col = None
+    for cand in ['SEASON_KEY', 'SEASON', 'SEASON_ID', 'SEASON_YEAR']:
+        if cand in df.columns:
+            season_col = cand
+            break
+
+    elo_pre = pd.Series(np.nan, index=df.index, dtype=float)
+    elo_opp_pre = pd.Series(np.nan, index=df.index, dtype=float)
+    elo_diff_pre = pd.Series(np.nan, index=df.index, dtype=float)
+    p_elo_home = pd.Series(np.nan, index=df.index, dtype=float)
+
+    current_ratings: Dict[Tuple[int, object], float] = {}
+    last_rating_global: Dict[int, float] = {}
+    last_season_seen: Dict[int, object] = {}
+
+    df['GAME_ID'] = df['GAME_ID'].astype('string')
+
+    for game_id, game in df.groupby('GAME_ID', sort=False):
+        game = game.sort_values('GAME_DATE')
+        if len(game) < 2:
+            continue
+
+        home_mask = game['MATCHUP'].astype(str).str.contains('vs', case=False, na=False)
+        if not home_mask.any():
+            continue
+
+        try:
+            home_row = game[home_mask].iloc[0]
+            away_row = game[~home_mask].iloc[0]
+        except IndexError:
+            continue
+
+        home_idx = home_row.name
+        away_idx = away_row.name
+
+        home_team = int(home_row['TEAM_ID'])
+        away_team = int(away_row['TEAM_ID'])
+
+        home_season = home_row[season_col] if season_col else home_row['GAME_DATE'].year
+        away_season = away_row[season_col] if season_col else away_row['GAME_DATE'].year
+
+        for team, season in ((home_team, home_season), (away_team, away_season)):
+            key = (team, season)
+            if key not in current_ratings:
+                prev_final = last_rating_global.get(team, base_rating)
+                if last_season_seen.get(team) == season:
+                    starting = current_ratings.get(key, prev_final)
+                else:
+                    starting = carry_over * prev_final + (1.0 - carry_over) * base_rating
+                current_ratings[key] = float(starting)
+                last_season_seen[team] = season
+
+        home_key = (home_team, home_season)
+        away_key = (away_team, away_season)
+
+        home_rating = current_ratings[home_key]
+        away_rating = current_ratings[away_key]
+
+        expected_home = 1.0 / (
+            1.0 + 10 ** ((away_rating - home_rating - home_advantage) / 400.0)
+        )
+        expected_home = float(np.clip(expected_home, 0.0, 1.0))
+        expected_away = float(1.0 - expected_home)
+
+        home_result = float(home_row['WL_NUM'])
+        away_result = float(away_row['WL_NUM'])
+
+        new_home = home_rating + k_factor * (home_result - expected_home)
+        new_away = away_rating + k_factor * (away_result - expected_away)
+
+        elo_pre.loc[home_idx] = home_rating
+        elo_pre.loc[away_idx] = away_rating
+        elo_opp_pre.loc[home_idx] = away_rating
+        elo_opp_pre.loc[away_idx] = home_rating
+        elo_diff_pre.loc[home_idx] = home_rating - away_rating
+        elo_diff_pre.loc[away_idx] = away_rating - home_rating
+
+        p_elo_home.loc[home_idx] = expected_home
+        p_elo_home.loc[away_idx] = expected_away
+
+        current_ratings[home_key] = float(new_home)
+        current_ratings[away_key] = float(new_away)
+        last_rating_global[home_team] = float(new_home)
+        last_rating_global[away_team] = float(new_away)
+
+    df['ELO_PRE'] = elo_pre
+    df['ELO_OPP_PRE'] = elo_opp_pre
+    df['ELO_DIFF_PRE'] = elo_diff_pre
+    df['P_ELO_HOME'] = p_elo_home.clip(lower=0.0, upper=1.0)
+
+    print("OK: Elo sin fuga calculado (ELO_PRE, ELO_OPP_PRE, ELO_DIFF_PRE, P_ELO_HOME).")
+
+    return df
+
+
+# =========================
+# Match-level builder
+# =========================
+def build_match_level(
+    df: pd.DataFrame,
+    lineup_scores: Optional[pd.DataFrame] = None,
+) -> pd.DataFrame:
+    """Construye dataset a nivel partido con diferenciales HOME–AWAY."""
+
+    df = ensure_teamid_and_date(df)
+
+    required_cols = {'GAME_ID', 'MATCHUP', 'TEAM_ID', 'WL_NUM', 'GAME_DATE'}
+    missing = required_cols - set(df.columns)
+    if missing:
+        raise ValueError(f"Faltan columnas necesarias para match-level: {sorted(missing)}")
+
+    df['GAME_ID'] = df['GAME_ID'].astype('string')
+    df['IS_HOME'] = df['MATCHUP'].astype(str).str.contains('vs', case=False, na=False).astype(int)
+
+    home = df[df['IS_HOME'] == 1].copy()
+    away = df[df['IS_HOME'] == 0].copy()
+
+    home_pref = home.add_prefix('HOME_')
+    away_pref = away.add_prefix('AWAY_')
+
+    merged = home_pref.merge(
+        away_pref,
+        left_on='HOME_GAME_ID',
+        right_on='AWAY_GAME_ID',
+        how='inner',
+    )
+
+    if merged.empty:
+        raise ValueError('No se pudieron emparejar partidos home/away. Revisa MATCHUP.')
+
+    match_df = pd.DataFrame(
+        {
+            'GAME_ID': merged['HOME_GAME_ID'],
+            'GAME_DATE': merged['HOME_GAME_DATE'],
+            'HOME_TEAM_ID': pd.to_numeric(merged['HOME_TEAM_ID'], errors='coerce').astype('Int64'),
+            'AWAY_TEAM_ID': pd.to_numeric(merged['AWAY_TEAM_ID'], errors='coerce').astype('Int64'),
+            'WL_NUM': pd.to_numeric(merged['HOME_WL_NUM'], errors='coerce'),
+            'HOME_COURT': 1,
+        }
+    )
+
+    def _diff(base_cols: Iterable[str]) -> None:
+        for col in base_cols:
+            home_col = f'HOME_{col}'
+            away_col = f'AWAY_{col}'
+            if home_col in merged.columns and away_col in merged.columns:
+                match_df[f'DIFF_{col}'] = (
+                    pd.to_numeric(merged[home_col], errors='coerce')
+                    - pd.to_numeric(merged[away_col], errors='coerce')
+                )
+
+    roll_cols = sorted([c for c in df.columns if c.startswith('ROLL10_')])
+    venue_cols = sorted([c for c in df.columns if c.startswith('VENUE_')])
+    _diff(roll_cols)
+    _diff(venue_cols)
+
+    enhanced_cols = ['TURNOVER_RATIO', 'PACE', 'LAST_5_PCT', 'DAYS_REST', 'WIN_STREAK', 'SEASON_W_PCT']
+    _diff(enhanced_cols)
+
+    lineup_cols = [
+        'LINEUP_WEIGHTED_NET',
+        'LINEUP_TOP5_NET',
+        'LINEUP_TOP5_MIN',
+        'LINEUP_STABILITY_HHI',
+        'LINEUP_VARIETY_5MIN',
+        'LINEUP_TOTAL_MIN',
+    ]
+    _diff(lineup_cols)
+
+    if 'HOME_P_ELO_HOME' in merged.columns:
+        match_df['P_ELO_HOME'] = pd.to_numeric(merged['HOME_P_ELO_HOME'], errors='coerce')
+
+    elo_pairs = [
+        ('ELO_PRE', 'DIFF_ELO_PRE'),
+        ('ELO_OPP_PRE', 'DIFF_ELO_OPP_PRE'),
+        ('ELO_DIFF_PRE', 'DIFF_ELO_DIFF_PRE'),
+    ]
+    for base_col, diff_name in elo_pairs:
+        home_col = f'HOME_{base_col}'
+        away_col = f'AWAY_{base_col}'
+        if home_col in merged.columns and away_col in merged.columns:
+            match_df[diff_name] = (
+                pd.to_numeric(merged[home_col], errors='coerce')
+                - pd.to_numeric(merged[away_col], errors='coerce')
+            )
+
+    calendar_cols = [
+        'DAYS_REST_CALC',
+        'IS_B2B_CALC',
+        'GAMES_IN_3D_CALC',
+        'GAMES_IN_5D_CALC',
+        'GAMES_IN_7D_CALC',
+    ]
+    _diff(calendar_cols)
+
+    if {'HOME_IS_B2B_CALC', 'AWAY_IS_B2B_CALC'}.issubset(merged.columns):
+        home_b2b = pd.to_numeric(merged['HOME_IS_B2B_CALC'], errors='coerce').fillna(0.0)
+        away_b2b = pd.to_numeric(merged['AWAY_IS_B2B_CALC'], errors='coerce').fillna(0.0)
+        diff_b2b = home_b2b - away_b2b
+        match_df['DIFF_B2B_FLAG'] = diff_b2b
+        match_df['B2B_ADVANTAGE'] = diff_b2b
+
+    if lineup_scores is not None and not lineup_scores.empty:
+        lineup_df = lineup_scores.copy()
+        if 'GAME_ID' not in lineup_df.columns:
+            raise ValueError('El parquet de lineup scores debe incluir GAME_ID.')
+        rename_map = {
+            'home_lineup_score': 'HOME_LINEUP_SCORE',
+            'away_lineup_score': 'AWAY_LINEUP_SCORE',
+            'home_lineup_quality': 'HOME_LINEUP_QUALITY',
+            'away_lineup_quality': 'AWAY_LINEUP_QUALITY',
+            'home_lineup_synergy': 'HOME_LINEUP_SYNERGY',
+            'away_lineup_synergy': 'AWAY_LINEUP_SYNERGY',
+            'home_lineup_id': 'HOME_LINEUP_ID',
+            'away_lineup_id': 'AWAY_LINEUP_ID',
+            'home_players': 'HOME_PLAYERS',
+            'away_players': 'AWAY_PLAYERS',
+            'home_minutes_hist': 'HOME_LINEUP_MINUTES_HIST',
+            'away_minutes_hist': 'AWAY_LINEUP_MINUTES_HIST',
+        }
+        lineup_df = lineup_df.rename(columns={k: v for k, v in rename_map.items() if k in lineup_df.columns})
+        lineup_df['GAME_ID'] = lineup_df['GAME_ID'].astype('string')
+        match_df = match_df.merge(lineup_df, on='GAME_ID', how='left')
+        if {'HOME_LINEUP_SCORE', 'AWAY_LINEUP_SCORE'}.issubset(match_df.columns):
+            match_df['LINEUP_SCORE_DIFF'] = (
+                pd.to_numeric(match_df['HOME_LINEUP_SCORE'], errors='coerce')
+                - pd.to_numeric(match_df['AWAY_LINEUP_SCORE'], errors='coerce')
+            )
+
+    impute_match_differentials_inplace(match_df)
+
+    allowed_exact = {
+        'GAME_ID',
+        'GAME_DATE',
+        'HOME_TEAM_ID',
+        'AWAY_TEAM_ID',
+        'WL_NUM',
+        'HOME_COURT',
+        'P_ELO_HOME',
+        'LINEUP_SCORE_DIFF',
+        'HOME_LINEUP_SCORE',
+        'AWAY_LINEUP_SCORE',
+        'HOME_LINEUP_QUALITY',
+        'AWAY_LINEUP_QUALITY',
+        'HOME_LINEUP_SYNERGY',
+        'AWAY_LINEUP_SYNERGY',
+        'HOME_LINEUP_ID',
+        'AWAY_LINEUP_ID',
+        'HOME_PLAYERS',
+        'AWAY_PLAYERS',
+        'HOME_LINEUP_MINUTES_HIST',
+        'AWAY_LINEUP_MINUTES_HIST',
+        'B2B_ADVANTAGE',
+        'DIFF_B2B_FLAG',
+    }
+
+    for col in match_df.columns:
+        if col in allowed_exact:
+            continue
+        if col.startswith('DIFF_'):
+            continue
+        raise AssertionError(
+            f"Se detectó una columna no permitida en match-level: {col}. Revisa prefijos aceptados."
+        )
+
+    match_df['WL_NUM'] = pd.to_numeric(match_df['WL_NUM'], errors='coerce').fillna(0.0)
+
+    return match_df
 
 
 # =========================
