@@ -29,52 +29,85 @@ def main() -> None:
     current_dir = Path(__file__).resolve().parent
     repo_root = current_dir.parent.parent
     data_root = repo_root / '00_data'
-    season = '2024-25'
 
-    team_input = data_root / '00c_final' / season / 'teamgamelogs_by_game.parquet'
-    venue_path = data_root / '00c_final' / season / 'dashboards' / 'team_dashboard_by_general_splits__dataset_1.parquet'
     output_path = (
         data_root
         / '00d_featurized'
-        / season
         / '00a_WL_prediction'
         / 'teamgamelogs.parquet'
     )
-    enhanced_config: dict[str, object] = {}
+    seasons_root = data_root / '00c_final'
 
-    if not team_input.exists():
-        raise FileNotFoundError(f'No existe el parquet de entrada requerido: {team_input}')
+    if not seasons_root.exists():
+        raise FileNotFoundError('No existe el directorio de temporadas: 00_data/00c_final')
 
-    df = pd.read_parquet(team_input)
-    print(f"Dataset base cargado: {df.shape[0]} filas, {df.shape[1]} columnas")
-    print('✅ Filtro competitivo')
+    season_dirs = sorted([p for p in seasons_root.iterdir() if p.is_dir()])
+    dfs: list[pd.DataFrame] = []
 
-    if 'WL_NUM' not in df.columns:
-        if 'WL' in df.columns:
-            df['WL_NUM'] = (
-                df['WL']
-                .astype(str)
-                .str.strip()
-                .str.upper()
-                .map({'W': 1, 'L': 0})
-            )
-            print('🔧 Se creó WL_NUM a partir de WL.')
+    for season_dir in season_dirs:
+        team_input = season_dir / 'teamgamelogs_by_game.parquet'
+        venue_path = (
+            season_dir / 'dashboards' / 'team_dashboard_by_general_splits__dataset_1.parquet'
+        )
+        daysrest_path = (
+            season_dir / 'dashboards' / 'team_dashboard_by_days_rest__dataset_1.parquet'
+        )
+
+        if not team_input.exists():
+            print(f"⚠️  Sin datos en {season_dir.name}, se omite.")
+            continue
+
+        df = pd.read_parquet(team_input)
+        print(
+            f"Dataset {season_dir.name}: {df.shape[0]} filas, {df.shape[1]} columnas"
+        )
+        print('✅ Filtro competitivo')
+
+        if 'WL_NUM' not in df.columns:
+            if 'WL' in df.columns:
+                df['WL_NUM'] = (
+                    df['WL']
+                    .astype(str)
+                    .str.strip()
+                    .str.upper()
+                    .map({'W': 1, 'L': 0})
+                )
+                print('🔧 Se creó WL_NUM a partir de WL.')
+            else:
+                raise ValueError("Faltan 'WL' y 'WL_NUM' en el dataset base.")
+
+        df = features.features_baseline(df)
+        print('✅ BASELINE aplicado')
+
+        if venue_path.exists():
+            df = features.features_venue(df, venue_path=str(venue_path))
+            print('✅ VENUE aplicado')
         else:
-            raise ValueError("Faltan 'WL' y 'WL_NUM' en el dataset base.")
+            print(f"ℹ️  VENUE omitido en {season_dir.name} (sin dashboard)")
 
-    df = features.features_baseline(df)
-    print('✅ BASELINE aplicado')
+        enhanced_config: dict[str, object] = {
+            'days_rest_path': str(daysrest_path) if daysrest_path.exists() else None,
+            'new_features': ['DAYS_REST', 'LAST_5_PCT', 'BACK_TO_BACK_FLAG'],
+        }
+        df = features.features_enhanced(df, config=enhanced_config)
+        print('✅ ENHANCED aplicado')
 
-    df = features.features_venue(df, venue_path=str(venue_path))
-    print('✅ VENUE aplicado')
+        df = features.features_elo(df)
+        print('✅ ELO aplicado')
 
-    df = features.features_enhanced(df, config=enhanced_config)
-    print('✅ ENHANCED aplicado')
+        dfs.append(df)
 
-    df = features.features_elo(df)
-    print('✅ ELO aplicado')
+    if not dfs:
+        raise FileNotFoundError(
+            'No se encontraron temporadas con datos válidos en 00c_final'
+        )
 
-    match_df = features.build_match_level(df)
+    df_all = pd.concat(dfs, ignore_index=True)
+    print(
+        f"✅ Consolidado multi-temporada: {df_all.shape[0]} filas, {df_all.shape[1]} columnas"
+    )
+
+    match_df = features.build_match_level(df_all)
     print(f"✅ Match-level: {match_df.shape[0]} filas x {match_df.shape[1]} columnas")
 
     output_path.parent.mkdir(parents=True, exist_ok=True)
