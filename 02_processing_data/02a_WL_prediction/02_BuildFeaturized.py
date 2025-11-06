@@ -33,7 +33,13 @@ def main() -> None:
 
     team_input = data_root / '00c_final' / season / 'teamgamelogs_by_game.parquet'
     venue_path = data_root / '00c_final' / season / 'dashboards' / 'team_dashboard_by_general_splits__dataset_1.parquet'
-    output_path = data_root / '00d_featurized' / season / 'teamgamelogs_featurized.parquet'
+    output_path = (
+        data_root
+        / '00d_featurized'
+        / season
+        / '00a_WL_prediction'
+        / 'teamgamelogs.parquet'
+    )
     enhanced_config: dict[str, object] = {}
 
     if not team_input.exists():
