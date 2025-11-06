@@ -8,6 +8,19 @@ from pathlib import Path
 import pandas as pd
 
 
+def _print_feature_delta(
+    phase: str, cols_before: set[str], cols_after: set[str], max_show: int = 10
+) -> None:
+    new_cols = list(cols_after - cols_before)
+    n = len(new_cols)
+    if n == 0:
+        print(f"✅ {phase} aplicado (0 nuevas)")
+        return
+    sample = ", ".join(new_cols[:max_show])
+    tail = "" if n <= max_show else f" …(+{n - max_show} más)"
+    print(f"✅ {phase} aplicado (+{n}) -> {sample}{tail}")
+
+
 def load_feature_module() -> object:
     base_path = Path(__file__).resolve()
     module_path = base_path.with_name('02_FeatureFunctions.py')
@@ -76,12 +89,14 @@ def main() -> None:
             else:
                 raise ValueError("Faltan 'WL' y 'WL_NUM' en el dataset base.")
 
+        cols0 = set(df.columns)
         df = features.features_baseline(df)
-        print('✅ BASELINE aplicado')
+        _print_feature_delta('BASELINE', cols0, set(df.columns))
 
         if venue_path.exists():
+            cols0 = set(df.columns)
             df = features.features_venue(df, venue_path=str(venue_path))
-            print('✅ VENUE aplicado')
+            _print_feature_delta('VENUE', cols0, set(df.columns))
         else:
             print(f"ℹ️  VENUE omitido en {season_dir.name} (sin dashboard)")
 
@@ -89,11 +104,13 @@ def main() -> None:
             'days_rest_path': str(daysrest_path) if daysrest_path.exists() else None,
             'new_features': ['DAYS_REST', 'LAST_5_PCT', 'BACK_TO_BACK_FLAG'],
         }
+        cols0 = set(df.columns)
         df = features.features_enhanced(df, config=enhanced_config)
-        print('✅ ENHANCED aplicado')
+        _print_feature_delta('ENHANCED', cols0, set(df.columns))
 
+        cols0 = set(df.columns)
         df = features.features_elo(df)
-        print('✅ ELO aplicado')
+        _print_feature_delta('ELO', cols0, set(df.columns))
 
         dfs.append(df)
 
