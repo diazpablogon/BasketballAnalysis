@@ -25,7 +25,6 @@ def load_feature_module() -> object:
 
 def read_optional_parquet(path: Path) -> pd.DataFrame | None:
     if not path.exists():
-        print(f"⚠️ Archivo opcional no encontrado: {path}")
         return None
     try:
         return pd.read_parquet(path)
@@ -45,7 +44,10 @@ def main() -> None:
     team_input = data_root / '00c_final' / season / 'teamgamelogs_by_game.parquet'
     venue_path = data_root / '00c_final' / season / 'dashboards' / 'team_dashboard_by_general_splits__dataset_1.parquet'
     lineup_team_path = data_root / '00c_final' / season / 'dashboards' / 'team_dash_lineups__dataset_1.parquet'
-    lineup_score_path = data_root / '00c_final' / season / 'dashboards' / 'lineup_scores_by_game.parquet'
+    lineup_score_path = Path(
+        '/Users/pablo/Documents/BigData/BasketballAnalysis/00_data/00c_final/2024-25/dashboards/'
+        'team_dash_lineups__dataset_1.parquet'
+    )
     output_path = data_root / '00d_featurized' / season / 'teamgamelogs_featurized.parquet'
 
     if not team_input.exists():
@@ -99,6 +101,8 @@ def main() -> None:
     print('✅ Elo sin fuga añadido')
 
     lineup_scores_df = read_optional_parquet(lineup_score_path)
+    if lineup_scores_df is not None:
+        print(f"ℹ️  Lineup por partido aplicado desde '{lineup_score_path.name}'")
 
     match_df = features.build_match_level(df, lineup_scores=lineup_scores_df)
     print(f"✅ Match-level: {match_df.shape[0]} filas x {match_df.shape[1]} columnas")

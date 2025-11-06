@@ -1211,7 +1211,20 @@ def features_enhanced(df: pd.DataFrame, config: Dict[str, object]) -> pd.DataFra
         g['DAYS_REST_RANGE'] = g['DAYS_REST'].map(_format_range)
         return g
 
-    d = d.groupby(group_cols, group_keys=False).apply(process_group).reset_index(drop=True)
+    try:
+        d = (
+            d.groupby(group_cols, group_keys=False)
+            .apply(process_group, include_groups=False)
+            .reset_index(drop=True)
+        )
+    except TypeError:
+        non_group_cols = [c for c in d.columns if c not in group_cols]
+        d = (
+            d.loc[:, group_cols + non_group_cols]
+            .groupby(group_cols, group_keys=False)
+            .apply(process_group)
+            .reset_index(drop=True)
+        )
 
     # === Refuerzo con parquet de descanso (opcional) usando MERGE SEGURO ===
     days_path = (config or {}).get('days_rest_path') if isinstance(config, dict) else None
@@ -1636,8 +1649,15 @@ def build_match_level(
         home_b2b = pd.to_numeric(merged['HOME_IS_B2B_CALC'], errors='coerce').fillna(0.0)
         away_b2b = pd.to_numeric(merged['AWAY_IS_B2B_CALC'], errors='coerce').fillna(0.0)
         diff_b2b = home_b2b - away_b2b
-        match_df['DIFF_B2B_FLAG'] = diff_b2b
-        match_df['B2B_ADVANTAGE'] = diff_b2b
+        to_add = pd.DataFrame(
+            {
+                'DIFF_B2B_FLAG': diff_b2b,
+                'B2B_ADVANTAGE': diff_b2b,
+            },
+            index=match_df.index,
+        )
+        match_df = pd.concat([match_df, to_add], axis=1)
+        match_df = match_df.copy()
 
     if lineup_scores is not None and not lineup_scores.empty:
         lineup_df = lineup_scores.copy()
