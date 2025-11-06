@@ -1219,12 +1219,20 @@ def features_enhanced(df: pd.DataFrame, config: Dict[str, object]) -> pd.DataFra
 
     # --- Asegurar que las columnas de agrupación se conservan ---
     non_group_cols = [c for c in d.columns if c not in group_cols]
-    d = (
+    grouped = (
         d.loc[:, group_cols + non_group_cols]
-        .groupby(group_cols, as_index=False, group_keys=False)
-        .apply(process_group)
-        .reset_index(drop=True)
+        .groupby(group_cols, as_index=False, group_keys=False, sort=False)
     )
+
+    processed_chunks: List[pd.DataFrame] = []
+    for _, chunk in grouped:
+        processed = process_group(chunk.copy())
+        processed_chunks.append(processed)
+
+    if processed_chunks:
+        d = pd.concat(processed_chunks, ignore_index=True)
+    else:
+        d = d.loc[:, group_cols + non_group_cols].copy()
 
     # Sanidad: TEAM_ID no debe perderse
     if 'TEAM_ID' not in d.columns:
