@@ -265,6 +265,11 @@ def features_lineup(
 ) -> pd.DataFrame:
     """Añade métricas estáticas de lineups por equipo si existe el parquet indicado."""
 
+    if 'TEAM_ID' not in df.columns:
+        raise ValueError(
+            "features_lineup requiere TEAM_ID; revisa features_enhanced para no eliminar columnas de agrupación."
+        )
+
     df = ensure_teamid_and_date(df)
 
     lineup_path = Path(lineup_path)
@@ -1211,19 +1216,19 @@ def features_enhanced(df: pd.DataFrame, config: Dict[str, object]) -> pd.DataFra
         g['DAYS_REST_RANGE'] = g['DAYS_REST'].map(_format_range)
         return g
 
-    try:
-        d = (
-            d.groupby(group_cols, group_keys=False)
-            .apply(process_group, include_groups=False)
-            .reset_index(drop=True)
-        )
-    except TypeError:
-        non_group_cols = [c for c in d.columns if c not in group_cols]
-        d = (
-            d.loc[:, group_cols + non_group_cols]
-            .groupby(group_cols, group_keys=False)
-            .apply(process_group)
-            .reset_index(drop=True)
+    # --- Asegurar que las columnas de agrupación se conservan ---
+    non_group_cols = [c for c in d.columns if c not in group_cols]
+    d = (
+        d.loc[:, group_cols + non_group_cols]
+        .groupby(group_cols, as_index=False, group_keys=False)
+        .apply(process_group)
+        .reset_index(drop=True)
+    )
+
+    # Sanidad: TEAM_ID no debe perderse
+    if 'TEAM_ID' not in d.columns:
+        raise AssertionError(
+            "features_enhanced perdió TEAM_ID; conserva group_cols al aplicar."
         )
 
     # === Refuerzo con parquet de descanso (opcional) usando MERGE SEGURO ===
