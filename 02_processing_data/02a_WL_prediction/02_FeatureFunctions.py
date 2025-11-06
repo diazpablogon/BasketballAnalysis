@@ -46,6 +46,7 @@ __all__ = [
     'features_venue',
     'features_enhanced',
     'features_lineup',
+    'features_elo',
     'add_calendar_no_leak',
     'add_elo_no_leak',
     'build_match_level',
@@ -1436,6 +1437,15 @@ def add_calendar_no_leak(df: pd.DataFrame) -> pd.DataFrame:
 # =========================
 # Elo sin fuga
 # =========================
+def features_elo(
+    df: pd.DataFrame,
+    **kwargs,
+) -> pd.DataFrame:
+    """Wrapper canónico para calcular Elo pre-partido sin fuga."""
+
+    return add_elo_no_leak(df, **kwargs)
+
+
 def add_elo_no_leak(
     df: pd.DataFrame,
     *,

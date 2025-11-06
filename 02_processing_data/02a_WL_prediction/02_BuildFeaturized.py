@@ -23,16 +23,6 @@ def load_feature_module() -> object:
     return module
 
 
-def read_optional_parquet(path: Path) -> pd.DataFrame | None:
-    if not path.exists():
-        return None
-    try:
-        return pd.read_parquet(path)
-    except Exception as exc:  # pragma: no cover - robustez
-        print(f"⚠️ No se pudo leer {path.name}: {exc}")
-        return None
-
-
 def main() -> None:
     features = load_feature_module()
 
@@ -43,12 +33,8 @@ def main() -> None:
 
     team_input = data_root / '00c_final' / season / 'teamgamelogs_by_game.parquet'
     venue_path = data_root / '00c_final' / season / 'dashboards' / 'team_dashboard_by_general_splits__dataset_1.parquet'
-    lineup_team_path = data_root / '00c_final' / season / 'dashboards' / 'team_dash_lineups__dataset_1.parquet'
-    lineup_score_path = Path(
-        '/Users/pablo/Documents/BigData/BasketballAnalysis/00_data/00c_final/2024-25/dashboards/'
-        'team_dash_lineups__dataset_1.parquet'
-    )
     output_path = data_root / '00d_featurized' / season / 'teamgamelogs_featurized.parquet'
+    enhanced_config: dict[str, object] = {}
 
     if not team_input.exists():
         raise FileNotFoundError(f'No existe el parquet de entrada requerido: {team_input}')
@@ -76,40 +62,19 @@ def main() -> None:
     df = features.features_venue(df, venue_path=str(venue_path))
     print('✅ VENUE aplicado')
 
-    df = features.features_enhanced(df, config={})
-    features.impute_advanced_inplace(df)
+    df = features.features_enhanced(df, config=enhanced_config)
     print('✅ ENHANCED aplicado')
 
-    df = features.features_lineup(df, lineup_path=str(lineup_team_path))
-    lineup_cols = [
-        'LINEUP_WEIGHTED_NET',
-        'LINEUP_TOP5_NET',
-        'LINEUP_TOP5_MIN',
-        'LINEUP_STABILITY_HHI',
-        'LINEUP_VARIETY_5MIN',
-        'LINEUP_TOTAL_MIN',
-    ]
-    if any(col in df.columns for col in lineup_cols):
-        print('✅ LINEUP aplicado')
-    else:
-        print('⚠️ LINEUP omitido (sin métricas disponibles)')
+    df = features.features_elo(df)
+    print('✅ ELO aplicado')
 
-    df = features.add_calendar_no_leak(df)
-    print('✅ Calendario sin fuga añadido')
-
-    df = features.add_elo_no_leak(df)
-    print('✅ Elo sin fuga añadido')
-
-    lineup_scores_df = read_optional_parquet(lineup_score_path)
-    if lineup_scores_df is not None:
-        print(f"ℹ️  Lineup por partido aplicado desde '{lineup_score_path.name}'")
-
-    match_df = features.build_match_level(df, lineup_scores=lineup_scores_df)
+    match_df = features.build_match_level(df)
     print(f"✅ Match-level: {match_df.shape[0]} filas x {match_df.shape[1]} columnas")
 
     output_path.parent.mkdir(parents=True, exist_ok=True)
     match_df.to_parquet(output_path, index=False)
     print(f"Parquet final guardado en: {output_path}")
+    print('✅ Match-level final guardado')
 
 
 if __name__ == '__main__':
