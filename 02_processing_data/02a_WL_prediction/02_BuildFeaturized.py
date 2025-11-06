@@ -55,6 +55,19 @@ def main() -> None:
     print(f"Dataset base cargado: {df.shape[0]} filas, {df.shape[1]} columnas")
     print('✅ Filtro competitivo')
 
+    if 'WL_NUM' not in df.columns:
+        if 'WL' in df.columns:
+            df['WL_NUM'] = (
+                df['WL']
+                .astype(str)
+                .str.strip()
+                .str.upper()
+                .map({'W': 1, 'L': 0})
+            )
+            print('🔧 Se creó WL_NUM a partir de WL.')
+        else:
+            raise ValueError("Faltan 'WL' y 'WL_NUM' en el dataset base.")
+
     df = features.features_baseline(df)
     print('✅ BASELINE aplicado')
 
