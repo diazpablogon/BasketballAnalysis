@@ -158,7 +158,7 @@ def features_roll10(df: pd.DataFrame) -> pd.DataFrame:
 # Baseline (ROLL10) block
 # =========================
 def features_baseline(df: pd.DataFrame) -> pd.DataFrame:
-    """Preserva identificadores y asegura limpieza básica de métricas ROLL10_."""
+    """Normaliza e imputa las métricas ROLL10_ manteniendo identificadores básicos."""
 
     df = ensure_teamid_and_date(df)
 
@@ -168,22 +168,44 @@ def features_baseline(df: pd.DataFrame) -> pd.DataFrame:
         'GAME_ID',
         'GAME_DATE',
         'MATCHUP',
-        'WL',
-        'WL_NUM',
     ]
 
     missing_ids = [col for col in required_ids if col not in df.columns]
     if missing_ids:
         raise ValueError(f"Faltan columnas obligatorias para baseline: {missing_ids}")
 
+    if 'WL_NUM' not in df.columns:
+        if 'WL' in df.columns:
+            df['WL_NUM'] = (
+                df['WL']
+                .astype(str)
+                .str.strip()
+                .str.upper()
+                .map({'W': 1, 'L': 0})
+            )
+        else:
+            raise ValueError("Faltan 'WL' y 'WL_NUM' para construir features baseline.")
+
+    df['WL_NUM'] = pd.to_numeric(df['WL_NUM'], errors='coerce')
+
     roll_cols = sorted([c for c in df.columns if c.startswith('ROLL10_')])
     if not roll_cols:
         raise ValueError('No se encontraron columnas con prefijo ROLL10_.')
 
+    id_columns = [
+        'TEAM_ID',
+        'TEAM_ABBREVIATION',
+        'GAME_ID',
+        'GAME_DATE',
+        'MATCHUP',
+        'WL_NUM',
+    ]
+
+    keep_cols = id_columns + roll_cols
+    df = df.loc[:, keep_cols].copy()
+
     for col in roll_cols:
         df[col] = pd.to_numeric(df[col], errors='coerce')
-
-    df['WL_NUM'] = pd.to_numeric(df['WL_NUM'], errors='coerce')
 
     df = df.sort_values(['TEAM_ID', 'GAME_DATE']).reset_index(drop=True)
 
@@ -1629,18 +1651,15 @@ def build_match_level(
     _diff(roll_cols)
     _diff(venue_cols)
 
-    enhanced_cols = ['TURNOVER_RATIO', 'PACE', 'LAST_5_PCT', 'DAYS_REST', 'WIN_STREAK', 'SEASON_W_PCT']
-    _diff(enhanced_cols)
-
-    lineup_cols = [
-        'LINEUP_WEIGHTED_NET',
-        'LINEUP_TOP5_NET',
-        'LINEUP_TOP5_MIN',
-        'LINEUP_STABILITY_HHI',
-        'LINEUP_VARIETY_5MIN',
-        'LINEUP_TOTAL_MIN',
+    enhanced_cols = [
+        'TURNOVER_RATIO',
+        'PACE',
+        'LAST_5_PCT',
+        'DAYS_REST',
+        'WIN_STREAK',
+        'SEASON_W_PCT',
     ]
-    _diff(lineup_cols)
+    _diff(enhanced_cols)
 
     if 'HOME_P_ELO_HOME' in merged.columns:
         match_df['P_ELO_HOME'] = pd.to_numeric(merged['HOME_P_ELO_HOME'], errors='coerce')
@@ -1659,55 +1678,10 @@ def build_match_level(
                 - pd.to_numeric(merged[away_col], errors='coerce')
             )
 
-    calendar_cols = [
-        'DAYS_REST_CALC',
-        'IS_B2B_CALC',
-        'GAMES_IN_3D_CALC',
-        'GAMES_IN_5D_CALC',
-        'GAMES_IN_7D_CALC',
-    ]
-    _diff(calendar_cols)
-
-    if {'HOME_IS_B2B_CALC', 'AWAY_IS_B2B_CALC'}.issubset(merged.columns):
-        home_b2b = pd.to_numeric(merged['HOME_IS_B2B_CALC'], errors='coerce').fillna(0.0)
-        away_b2b = pd.to_numeric(merged['AWAY_IS_B2B_CALC'], errors='coerce').fillna(0.0)
-        diff_b2b = home_b2b - away_b2b
-        to_add = pd.DataFrame(
-            {
-                'DIFF_B2B_FLAG': diff_b2b,
-                'B2B_ADVANTAGE': diff_b2b,
-            },
-            index=match_df.index,
-        )
-        match_df = pd.concat([match_df, to_add], axis=1)
-        match_df = match_df.copy()
-
     if lineup_scores is not None and not lineup_scores.empty:
-        lineup_df = lineup_scores.copy()
-        if 'GAME_ID' not in lineup_df.columns:
-            raise ValueError('El parquet de lineup scores debe incluir GAME_ID.')
-        rename_map = {
-            'home_lineup_score': 'HOME_LINEUP_SCORE',
-            'away_lineup_score': 'AWAY_LINEUP_SCORE',
-            'home_lineup_quality': 'HOME_LINEUP_QUALITY',
-            'away_lineup_quality': 'AWAY_LINEUP_QUALITY',
-            'home_lineup_synergy': 'HOME_LINEUP_SYNERGY',
-            'away_lineup_synergy': 'AWAY_LINEUP_SYNERGY',
-            'home_lineup_id': 'HOME_LINEUP_ID',
-            'away_lineup_id': 'AWAY_LINEUP_ID',
-            'home_players': 'HOME_PLAYERS',
-            'away_players': 'AWAY_PLAYERS',
-            'home_minutes_hist': 'HOME_LINEUP_MINUTES_HIST',
-            'away_minutes_hist': 'AWAY_LINEUP_MINUTES_HIST',
-        }
-        lineup_df = lineup_df.rename(columns={k: v for k, v in rename_map.items() if k in lineup_df.columns})
-        lineup_df['GAME_ID'] = lineup_df['GAME_ID'].astype('string')
-        match_df = match_df.merge(lineup_df, on='GAME_ID', how='left')
-        if {'HOME_LINEUP_SCORE', 'AWAY_LINEUP_SCORE'}.issubset(match_df.columns):
-            match_df['LINEUP_SCORE_DIFF'] = (
-                pd.to_numeric(match_df['HOME_LINEUP_SCORE'], errors='coerce')
-                - pd.to_numeric(match_df['AWAY_LINEUP_SCORE'], errors='coerce')
-            )
+        print(
+            "ℹ️  lineup_scores proporcionado, pero se ignora en esta versión sin métricas de lineups."
+        )
 
     impute_match_differentials_inplace(match_df)
 
@@ -1719,21 +1693,6 @@ def build_match_level(
         'WL_NUM',
         'HOME_COURT',
         'P_ELO_HOME',
-        'LINEUP_SCORE_DIFF',
-        'HOME_LINEUP_SCORE',
-        'AWAY_LINEUP_SCORE',
-        'HOME_LINEUP_QUALITY',
-        'AWAY_LINEUP_QUALITY',
-        'HOME_LINEUP_SYNERGY',
-        'AWAY_LINEUP_SYNERGY',
-        'HOME_LINEUP_ID',
-        'AWAY_LINEUP_ID',
-        'HOME_PLAYERS',
-        'AWAY_PLAYERS',
-        'HOME_LINEUP_MINUTES_HIST',
-        'AWAY_LINEUP_MINUTES_HIST',
-        'B2B_ADVANTAGE',
-        'DIFF_B2B_FLAG',
     }
 
     for col in match_df.columns:
