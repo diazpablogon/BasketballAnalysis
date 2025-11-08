@@ -327,11 +327,13 @@ def aggregate_player_boxscores_to_team(df_box: pd.DataFrame) -> pd.DataFrame:
         + (f": {sample}" if sample else '')
     )
 
+    aggregated.attrs['aggregated_columns'] = extra_cols
+
     return aggregated
 
 
 def features_baseline(df: pd.DataFrame) -> pd.DataFrame:
-    """Genera métricas ROLL10_* a partir del boxscore crudo y conserva identificadores básicos."""
+    """Genera métricas ROLL10_* sin fuga e incorpora agregados de boxscore por equipo."""
 
     team_box_attr = getattr(df, 'attrs', {}).get('team_boxscores') if hasattr(df, 'attrs') else None
     df = ensure_teamid_and_date(df)
@@ -362,12 +364,24 @@ def features_baseline(df: pd.DataFrame) -> pd.DataFrame:
 
     df['WL_NUM'] = pd.to_numeric(df['WL_NUM'], errors='coerce')
 
+    baseline_debug: Dict[str, object] = {}
+
     global _TEAM_BOX_GLOBAL
     team_box = team_box_attr if team_box_attr is not None else _TEAM_BOX_GLOBAL
     _TEAM_BOX_GLOBAL = None
 
+    added_cols: List[str] = []
+    resolved_pairs: List[str] = []
+    chosen_columns: List[str] = []
+    team_box_cols: List[str] = []
+
     if team_box is not None and not team_box.empty:
+        aggregated_cols = []
+        if hasattr(team_box, 'attrs'):
+            aggregated_cols = team_box.attrs.get('aggregated_columns', []) or []
         team_box = ensure_teamid_and_date(team_box)
+        if aggregated_cols:
+            team_box.attrs['aggregated_columns'] = aggregated_cols
         team_box = team_box.copy()
         team_box['_MERGE_GAME_ID'] = team_box['GAME_ID'].astype('string')
         merge_cols = [c for c in team_box.columns if c not in {'GAME_ID'}]
@@ -380,10 +394,60 @@ def features_baseline(df: pd.DataFrame) -> pd.DataFrame:
         )
         df = df.drop(columns=['_MERGE_GAME_ID'], errors='ignore')
         added_cols = sorted([c for c in df.columns if c not in before_cols])
+        team_box_cols = [
+            c
+            for c in (aggregated_cols if aggregated_cols else added_cols)
+            if c not in {'TEAM_ID', '_MERGE_GAME_ID'}
+        ]
+        team_box_cols = [
+            c[:-2] if c.endswith(('_x', '_y')) else c
+            for c in team_box_cols
+        ]
         if added_cols:
             print(
                 "BASELINE: Merge team_box añadió"
                 f" {len(added_cols)} columnas -> {', '.join(added_cols[:10])}"
+            )
+
+        suffix_pairs = {}
+        for col in list(df.columns):
+            if col.endswith('_x') or col.endswith('_y'):
+                base = col[:-2]
+                suffix_pairs.setdefault(base, set()).add(col)
+
+        for base, cols in sorted(suffix_pairs.items()):
+            if not cols:
+                continue
+            chosen = None
+            nan_ratios: Dict[str, float] = {}
+            for col in cols:
+                nan_ratios[col] = df[col].isna().mean()
+            if f'{base}_x' in cols and f'{base}_y' in cols:
+                x_nan = nan_ratios.get(f'{base}_x', 1.0)
+                y_nan = nan_ratios.get(f'{base}_y', 1.0)
+                if x_nan > 0.9 and y_nan <= 0.9:
+                    chosen = f'{base}_y'
+                elif y_nan > 0.9 and x_nan <= 0.9:
+                    chosen = f'{base}_x'
+                else:
+                    chosen = f'{base}_y' if y_nan <= x_nan else f'{base}_x'
+            else:
+                chosen = sorted(cols)[0]
+
+            if chosen is None:
+                continue
+            chosen_columns.append(chosen)
+            resolved_pairs.append(base)
+            df[base] = df[chosen]
+            drop_cols = [c for c in cols if c != chosen]
+            df = df.drop(columns=drop_cols, errors='ignore')
+            if chosen in df.columns and chosen != base:
+                df = df.drop(columns=[chosen], errors='ignore')
+
+        if resolved_pairs:
+            sample = ', '.join(chosen_columns[:10])
+            print(
+                f"BASELINE: Resueltos {len(resolved_pairs)} pares _x/_y; elegidas: {sample}"
             )
     else:
         print('⚠️ BASELINE: No se adjuntaron boxscores agregados; se mantiene el cálculo previo.')
@@ -448,17 +512,18 @@ def features_baseline(df: pd.DataFrame) -> pd.DataFrame:
         'E_OFF_RATING',
         'E_DEF_RATING',
         'E_NET_RATING',
-        'PACE',
-        'TM_TOV_PCT',
-        'REB_PCT',
-        'OREB_PCT',
+    ]
+
+    pace_metrics = ['PACE', 'TM_TOV_PCT', 'REB_PCT', 'OREB_PCT']
+
+    opponent_metrics = [
         'OPP_PTS_PAINT',
         'OPP_PTS_FB',
         'OPP_PTS_OFF_TOV',
         'OPP_PTS_2ND_CHANCE',
     ]
 
-    for col in base_metrics + rating_metrics:
+    for col in base_metrics + rating_metrics + pace_metrics + opponent_metrics:
         if col in df.columns:
             metric_sources[col] = col
 
@@ -483,34 +548,84 @@ def features_baseline(df: pd.DataFrame) -> pd.DataFrame:
 
     df = df.sort_values(['TEAM_ID', 'GAME_DATE']).reset_index(drop=True)
 
+    grouped = df.groupby('TEAM_ID', group_keys=False) if 'TEAM_ID' in df.columns else None
+
+    def _compute(series: pd.Series) -> pd.Series:
+        shifted = series.shift(1)
+        return shifted.rolling(10, min_periods=1).mean()
+
     roll_columns: List[str] = []
-    if 'TEAM_ID' in df.columns:
-        grouped = df.groupby('TEAM_ID', group_keys=False)
+    nan_before: Dict[str, int] = {}
+    key_nan_ratio: Dict[str, float] = {}
+    roll_nan_before: Dict[str, int] = {}
+    fallback_map: Dict[str, float] = {}
+    rating_roll_cols: List[str] = []
+    pace_roll_cols: List[str] = []
+    opp_roll_cols: List[str] = []
+    box_roll_cols: List[str] = []
 
-        def _compute(series: pd.Series) -> pd.Series:
-            shifted = series.shift(1)
-            return shifted.rolling(10, min_periods=1).mean()
+    def _metric_category(name: str) -> str:
+        upper = name.upper()
+        if any(token in upper for token in ['RATING', 'PACE']):
+            return 'ratingpace'
+        if any(token in upper for token in ['PCT', 'TS', 'EFG', 'RATIO', 'AST_TOV']):
+            return 'percentage'
+        return 'count'
 
+    if grouped is not None:
         for metric_name, source_col in metric_sources.items():
             if source_col not in df.columns:
                 continue
+            source_series = pd.to_numeric(df[source_col], errors='coerce')
+            nan_before[metric_name] = int(source_series.isna().sum())
+            if metric_name in {'OFF_RATING', 'DEF_RATING', 'NET_RATING', 'PACE'}:
+                key_nan_ratio[metric_name] = float(source_series.isna().mean())
             roll_col = f'ROLL10_{metric_name}'
             df[roll_col] = grouped[source_col].transform(_compute)
+            roll_nan_before[roll_col] = int(df[roll_col].isna().sum())
             roll_columns.append(roll_col)
+            category = _metric_category(metric_name)
+            fallback_val = np.nan
+            if category == 'percentage':
+                fallback_val = 0.5
+            elif category == 'ratingpace':
+                league_median = source_series.median(skipna=True)
+                fallback_val = float(league_median) if not pd.isna(league_median) else 0.0
+            else:
+                fallback_val = 0.0
+            fallback_map[roll_col] = float(fallback_val)
 
     for temp_col in temp_columns:
         df = df.drop(columns=temp_col, errors='ignore')
 
+    roll_nan_after_map: Dict[str, int] = {}
+
     if not roll_columns:
         print('⚠️ BASELINE: No se pudieron generar columnas ROLL10_ a partir del boxscore disponible.')
     else:
-        impute_roll10_inplace(df, roll_columns)
+        impute_roll10_inplace(df, roll_columns, fallback_map=fallback_map)
         print(f"BASELINE: Columnas ROLL10 generadas: {len(roll_columns)}")
         rating_roll_cols = [
             col
             for col in roll_columns
             if col.replace('ROLL10_', '') in rating_metrics
         ]
+        pace_roll_cols = [
+            col for col in roll_columns if col.replace('ROLL10_', '') in pace_metrics
+        ]
+        opp_roll_cols = [
+            col for col in roll_columns if col.replace('ROLL10_', '') in opponent_metrics
+        ]
+        box_roll_cols = [
+            col
+            for col in roll_columns
+            if col not in rating_roll_cols + pace_roll_cols + opp_roll_cols
+        ]
+        print(
+            "BASELINE: ROLL10 creadas = "
+            f"{len(roll_columns)} (ratings={len(rating_roll_cols)}, pace={len(pace_roll_cols)}, "
+            f"opp={len(opp_roll_cols)}, boxcore={len(box_roll_cols)})"
+        )
         if rating_roll_cols:
             preview = ', '.join(sorted(rating_roll_cols)[:10])
             print(
@@ -525,18 +640,94 @@ def features_baseline(df: pd.DataFrame) -> pd.DataFrame:
                 f"{min_date.date()} → {max_date.date()}"
             )
 
-    id_columns = [
-        'TEAM_ID',
-        'TEAM_ABBREVIATION',
-        'GAME_ID',
-        'GAME_DATE',
-        'MATCHUP',
-        'WL_NUM',
-    ]
+        roll_std = (
+            df[roll_columns]
+            .astype(float)
+            .std(skipna=True)
+            .sort_values(ascending=False)
+        )
+        top_std = ', '.join(
+            [f"{idx}={val:.2f}" for idx, val in roll_std.head(5).items()]
+        )
+        if top_std:
+            print(f"BASELINE: top vars por varianza (liga): {top_std}")
 
-    keep_cols = id_columns + sorted(roll_columns)
-    keep_cols = [col for col in keep_cols if col in df.columns]
-    df = df.loc[:, keep_cols].copy()
+        roll_nan_after_map = {
+            col: int(pd.to_numeric(df[col], errors='coerce').isna().sum())
+            for col in roll_columns
+        }
+        print('BASELINE: NaN audit (antes -> después) en métricas clave:')
+        audit_metrics = sorted(set(rating_metrics + pace_metrics + opponent_metrics))
+        for metric_name in audit_metrics:
+            roll_col = f'ROLL10_{metric_name}'
+            if roll_col not in roll_nan_after_map:
+                continue
+            before_val = nan_before.get(metric_name, 0)
+            after_val = roll_nan_after_map.get(roll_col, 0)
+            print(f" - {metric_name}: {before_val} -> {after_val}")
+
+        unique_teams = df['TEAM_ID'].dropna().unique() if 'TEAM_ID' in df.columns else np.array([])
+        if unique_teams.size > 0:
+            rng = np.random.default_rng(42)
+            sample_size = int(min(3, unique_teams.size))
+            teams_sample = rng.choice(unique_teams, size=sample_size, replace=False)
+            metrics_audit = [
+                'ROLL10_NET_RATING',
+                'ROLL10_OFF_RATING',
+                'ROLL10_DEF_RATING',
+                'ROLL10_PACE',
+            ]
+            for team_id in teams_sample:
+                team_df = df[df['TEAM_ID'] == team_id]
+                print(f"BASELINE audit TEAM_ID {team_id}:")
+                for metric in metrics_audit:
+                    if metric not in team_df.columns:
+                        continue
+                    series = pd.to_numeric(team_df[metric], errors='coerce')
+                    n_nozero = int((series.abs() > 1e-9).sum())
+                    mean_val = series.mean(skipna=True)
+                    std_val = series.std(skipna=True)
+                    min_val = series.min(skipna=True)
+                    max_val = series.max(skipna=True)
+                    print(
+                        f"  {metric}: n_nozero={n_nozero}, mean={mean_val:.3f}, std={std_val:.3f}, "
+                        f"min={min_val:.3f}, max={max_val:.3f}"
+                    )
+                    if std_val is not None and (pd.isna(std_val) or std_val < 1e-6 or n_nozero < 3):
+                        print(
+                            f"  ⚠️ posible rolling plano o mala imputación en TEAM_ID {team_id} -> {metric}"
+                        )
+
+    if team_box_cols:
+        coverage_cols = [
+            col
+            for col in team_box_cols
+            if col in df.columns and df[col].notna().mean() >= 0.8
+        ]
+    else:
+        coverage_cols = [
+            col
+            for col in df.columns
+            if col in metric_sources and df[col].notna().mean() >= 0.8
+        ]
+
+    baseline_debug['team_box_added_columns'] = added_cols
+    baseline_debug['team_box_high_coverage'] = sorted(set(coverage_cols))
+    baseline_debug['resolved_pairs'] = resolved_pairs
+    baseline_debug['resolved_choices'] = chosen_columns
+    baseline_debug['roll_columns'] = sorted(roll_columns)
+    baseline_debug['roll_categories'] = {
+        'ratings': len(rating_roll_cols),
+        'pace': len(pace_roll_cols),
+        'opponent': len(opp_roll_cols),
+        'boxcore': len(box_roll_cols),
+    }
+    baseline_debug['nan_ratio_before'] = key_nan_ratio
+    baseline_debug['nan_before'] = nan_before
+    baseline_debug['roll_nan_before'] = roll_nan_before
+    baseline_debug['roll_nan_after'] = roll_nan_after_map
+
+    df.attrs['baseline_debug'] = baseline_debug
 
     return df
 
@@ -712,8 +903,13 @@ def features_lineup(
 # =========================
 # Imputaciones auxiliares
 # =========================
-def impute_roll10_inplace(df: pd.DataFrame, columns: Optional[Iterable[str]] = None) -> pd.DataFrame:
-    """Imputa columnas ROLL10_ con la mediana (0.0 si no existe)."""
+def impute_roll10_inplace(
+    df: pd.DataFrame,
+    columns: Optional[Iterable[str]] = None,
+    *,
+    fallback_map: Optional[Dict[str, float]] = None,
+) -> pd.DataFrame:
+    """Imputa columnas ROLL10_ con mediana y, si falla, aplica fallback específico."""
 
     if columns is None:
         columns = [c for c in df.columns if c.startswith('ROLL10_')]
@@ -723,12 +919,17 @@ def impute_roll10_inplace(df: pd.DataFrame, columns: Optional[Iterable[str]] = N
             continue
         df[col] = pd.to_numeric(df[col], errors='coerce')
         if df[col].isna().all():
-            df[col] = 0.0
-            continue
-        median_val = df[col].median()
-        if pd.isna(median_val):
-            median_val = 0.0
-        df[col] = df[col].fillna(float(median_val))
+            fallback_val = None
+        else:
+            fallback_val = df[col].median(skipna=True)
+
+        if pd.isna(fallback_val):
+            if fallback_map and col in fallback_map and not pd.isna(fallback_map[col]):
+                fallback_val = fallback_map[col]
+            else:
+                fallback_val = 0.0
+
+        df[col] = df[col].fillna(float(fallback_val))
 
     return df
 
@@ -2013,6 +2214,32 @@ def build_match_level(
         )
 
     impute_match_differentials_inplace(match_df)
+
+    diff_columns = [c for c in match_df.columns if c.startswith('DIFF_')]
+    roll10_diff_columns = [c for c in diff_columns if c.startswith('DIFF_ROLL10_')]
+    print(
+        "MATCH: columnas DIFF creadas = "
+        f"{len(diff_columns)} (de {len(roll10_diff_columns)} ROLL10 de equipo)"
+    )
+    if not match_df.empty:
+        sample_row = match_df.iloc[0]
+        sample_game = sample_row.get('GAME_ID', 'N/A')
+        showcase = []
+        showcase_metrics = [
+            'DIFF_ROLL10_NET_RATING',
+            'DIFF_ROLL10_OFF_RATING',
+            'DIFF_ROLL10_DEF_RATING',
+            'DIFF_ROLL10_PACE',
+            'DIFF_ROLL10_TM_TOV_PCT',
+            'DIFF_ROLL10_REB_PCT',
+            'DIFF_ROLL10_OREB_PCT',
+            'DIFF_ROLL10_OPP_PTS_PAINT',
+        ]
+        for metric in showcase_metrics:
+            if metric in match_df.columns:
+                showcase.append(f"{metric}={sample_row.get(metric)}")
+        showcase_text = ', '.join(showcase) if showcase else 'sin métricas disponibles'
+        print(f"MATCH: ejemplo (GAME_ID={sample_game}): {showcase_text}")
 
     allowed_exact = {
         'GAME_ID',

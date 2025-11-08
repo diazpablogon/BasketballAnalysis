@@ -107,6 +107,24 @@ def main() -> None:
         df = features.features_baseline(df)
         print(f"BASELINE shape: {shape0} -> {df.shape}")
         _print_feature_delta('BASELINE', cols0, set(df.columns))
+        baseline_debug = df.attrs.get('baseline_debug', {}) if hasattr(df, 'attrs') else {}
+        high_cov = baseline_debug.get('team_box_high_coverage', []) or []
+        if high_cov:
+            sample = ', '.join(high_cov[:10])
+            print(f"team_box merge: columnas agregadas (no nulas en >80%): {sample}")
+        else:
+            print('team_box merge: columnas agregadas (no nulas en >80%): ninguna')
+
+        key_nan_ratio = baseline_debug.get('nan_ratio_before', {}) or {}
+        if key_nan_ratio:
+            formatted = ', '.join(
+                f"{metric}={ratio:.1%}" for metric, ratio in key_nan_ratio.items()
+            )
+            print(f"% de NaN por métrica clave (OFF/DEF/NET/PACE) antes del rolling: {formatted}")
+        else:
+            print('% de NaN por métrica clave (OFF/DEF/NET/PACE) antes del rolling: n/d')
+
+        print(f"Post-Baseline -> {df.shape[1]} columnas")
         setattr(features, '_TEAM_BOX_GLOBAL', None)
 
         if venue_path.exists():
@@ -115,6 +133,7 @@ def main() -> None:
             df = features.features_venue(df, venue_path=str(venue_path))
             print(f"VENUE shape: {shape0} -> {df.shape}")
             _print_feature_delta('VENUE', cols0, set(df.columns))
+            print(f"Post-Venue -> {df.shape[1]} columnas")
         else:
             print(f"ℹ️  VENUE omitido en {season_dir.name} (sin dashboard)")
 
@@ -127,12 +146,14 @@ def main() -> None:
         df = features.features_enhanced(df, config=enhanced_config)
         print(f"ENHANCED shape: {shape0} -> {df.shape}")
         _print_feature_delta('ENHANCED', cols0, set(df.columns))
+        print(f"Post-Enhanced -> {df.shape[1]} columnas")
 
         shape0 = df.shape
         cols0 = set(df.columns)
         df = features.features_elo(df)
         print(f"ELO shape: {shape0} -> {df.shape}")
         _print_feature_delta('ELO', cols0, set(df.columns))
+        print(f"Post-ELO -> {df.shape[1]} columnas")
 
         dfs.append(df)
 
