@@ -65,6 +65,7 @@ def main() -> None:
         daysrest_path = (
             season_dir / 'dashboards' / 'team_dashboard_by_days_rest__dataset_1.parquet'
         )
+        boxscores_path = season_dir / 'boxscores.parquet'
 
         if not team_input.exists():
             print(f"⚠️  Sin datos en {season_dir.name}, se omite.")
@@ -89,13 +90,30 @@ def main() -> None:
             else:
                 raise ValueError("Faltan 'WL' y 'WL_NUM' en el dataset base.")
 
+        team_box = None
+        if boxscores_path.exists():
+            raw_boxscores = pd.read_parquet(boxscores_path)
+            team_box = features.aggregate_player_boxscores_to_team(raw_boxscores)
+        else:
+            print(
+                f"⚠️  Boxscores por jugador no encontrados en {boxscores_path}. Se omite agregación."
+            )
+
+        setattr(features, '_TEAM_BOX_GLOBAL', team_box)
+        df.attrs['team_boxscores'] = team_box
+
+        shape0 = df.shape
         cols0 = set(df.columns)
         df = features.features_baseline(df)
+        print(f"BASELINE shape: {shape0} -> {df.shape}")
         _print_feature_delta('BASELINE', cols0, set(df.columns))
+        setattr(features, '_TEAM_BOX_GLOBAL', None)
 
         if venue_path.exists():
+            shape0 = df.shape
             cols0 = set(df.columns)
             df = features.features_venue(df, venue_path=str(venue_path))
+            print(f"VENUE shape: {shape0} -> {df.shape}")
             _print_feature_delta('VENUE', cols0, set(df.columns))
         else:
             print(f"ℹ️  VENUE omitido en {season_dir.name} (sin dashboard)")
@@ -104,12 +122,16 @@ def main() -> None:
             'days_rest_path': str(daysrest_path) if daysrest_path.exists() else None,
             'new_features': ['DAYS_REST', 'LAST_5_PCT', 'BACK_TO_BACK_FLAG'],
         }
+        shape0 = df.shape
         cols0 = set(df.columns)
         df = features.features_enhanced(df, config=enhanced_config)
+        print(f"ENHANCED shape: {shape0} -> {df.shape}")
         _print_feature_delta('ENHANCED', cols0, set(df.columns))
 
+        shape0 = df.shape
         cols0 = set(df.columns)
         df = features.features_elo(df)
+        print(f"ELO shape: {shape0} -> {df.shape}")
         _print_feature_delta('ELO', cols0, set(df.columns))
 
         dfs.append(df)

@@ -38,9 +38,12 @@ REST_METRIC_RULES: Dict[str, Tuple[str, str]] = {
 
 logger = logging.getLogger(__name__)
 
+_TEAM_BOX_GLOBAL: Optional[pd.DataFrame] = None
+
 __all__ = [
     'DEFAULT_DAYS_REST',
     'ensure_teamid_and_date',
+    'aggregate_player_boxscores_to_team',
     'features_baseline',
     'features_roll10',
     'features_venue',
@@ -157,9 +160,180 @@ def features_roll10(df: pd.DataFrame) -> pd.DataFrame:
 # =========================
 # Baseline (ROLL10) block
 # =========================
+def _parse_minutes_to_float(value: object) -> float:
+    """Convierte representaciones como 'MM:SS' a minutos en float."""
+
+    if pd.isna(value):
+        return np.nan
+
+    if isinstance(value, (int, float, np.integer, np.floating)):
+        return float(value)
+
+    text = str(value).strip()
+    if not text:
+        return np.nan
+
+    if ':' in text:
+        mins, _, secs = text.partition(':')
+        try:
+            minutes_val = float(mins)
+        except ValueError:
+            return np.nan
+        try:
+            seconds_val = float(secs)
+        except ValueError:
+            seconds_val = 0.0
+        return minutes_val + seconds_val / 60.0
+
+    try:
+        return float(text)
+    except ValueError:
+        return np.nan
+
+
+def aggregate_player_boxscores_to_team(df_box: pd.DataFrame) -> pd.DataFrame:
+    """Agrega boxscores por jugador al nivel (TEAM_ID, GAME_ID)."""
+
+    if df_box is None or df_box.empty:
+        print('⚠️ Boxscores por jugador vacíos, no se agregan métricas adicionales.')
+        return pd.DataFrame(columns=['TEAM_ID', 'GAME_ID'])
+
+    df = df_box.copy()
+    df.columns = [str(c).strip() for c in df.columns]
+
+    if 'TEAM_ID' not in df.columns or 'GAME_ID' not in df.columns:
+        raise ValueError('El boxscore debe contener TEAM_ID y GAME_ID para agregarse por equipo.')
+
+    df['TEAM_ID'] = pd.to_numeric(df['TEAM_ID'].map(_flatten_scalar), errors='coerce').astype('Int64')
+    df = df[df['TEAM_ID'].notna()].copy()
+    df['GAME_ID'] = df['GAME_ID'].map(_flatten_scalar)
+
+    df['_WEIGHT_MIN'] = df.get('MIN', pd.Series(np.nan, index=df.index, dtype=float))
+    df['_WEIGHT_MIN'] = df['_WEIGHT_MIN'].map(_parse_minutes_to_float)
+    poss_series = df['POSS'] if 'POSS' in df.columns else pd.Series(np.nan, index=df.index, dtype=float)
+    df['_WEIGHT_POSS'] = pd.to_numeric(poss_series, errors='coerce')
+
+    sum_columns = [
+        'FGM',
+        'FGA',
+        'FG3M',
+        'FG3A',
+        'FTM',
+        'FTA',
+        'OREB',
+        'DREB',
+        'REB',
+        'AST',
+        'TOV',
+        'STL',
+        'BLK',
+        'PF',
+        'PFD',
+        'PTS',
+        'PLUS_MINUS',
+        'POSS',
+        'PTS_2ND_CHANCE',
+        'PTS_FB',
+        'PTS_OFF_TOV',
+        'PTS_PAINT',
+    ]
+
+    weighted_columns = [
+        'FG_PCT',
+        'FG3_PCT',
+        'FT_PCT',
+        'TS_PCT',
+        'EFG_PCT',
+        'USG_PCT',
+        'TM_TOV_PCT',
+        'REB_PCT',
+        'OREB_PCT',
+        'PACE',
+        'PACE_PER40',
+        'OFF_RATING',
+        'DEF_RATING',
+        'NET_RATING',
+        'E_OFF_RATING',
+        'E_DEF_RATING',
+        'E_NET_RATING',
+        'E_PACE',
+        'OPP_EFG_PCT',
+        'OPP_FTA_RATE',
+        'OPP_OREB_PCT',
+        'OPP_PTS_2ND_CHANCE',
+        'OPP_PTS_FB',
+        'OPP_PTS_OFF_TOV',
+        'OPP_PTS_PAINT',
+        'OPP_TOV_PCT',
+    ]
+
+    available_sum = [c for c in sum_columns if c in df.columns]
+    available_weighted = [c for c in weighted_columns if c in df.columns]
+
+    for col in available_sum + available_weighted:
+        df[col] = pd.to_numeric(df[col], errors='coerce')
+
+    group_cols = ['TEAM_ID', 'GAME_ID']
+    grouped = df.groupby(group_cols, sort=False)
+
+    records: List[Dict[str, object]] = []
+
+    def _weighted_average(values: pd.Series, weights: pd.Series) -> float:
+        valid_mask = values.notna() & weights.notna()
+        if not valid_mask.any():
+            return float('nan')
+        w = weights[valid_mask]
+        v = values[valid_mask]
+        weight_sum = w.sum()
+        if pd.isna(weight_sum) or weight_sum <= 0:
+            return float('nan')
+        return float(np.average(v, weights=w))
+
+    for (team_id, game_id), group in grouped:
+        record: Dict[str, object] = {'TEAM_ID': team_id, 'GAME_ID': game_id}
+
+        for col in available_sum:
+            record[col] = group[col].sum(min_count=1)
+
+        for col in available_weighted:
+            values = group[col]
+            result = _weighted_average(values, group['_WEIGHT_MIN'])
+            if pd.isna(result):
+                result = _weighted_average(values, group['_WEIGHT_POSS'])
+            if pd.isna(result):
+                result = values.mean()
+            record[col] = result
+
+        records.append(record)
+
+    aggregated = pd.DataFrame.from_records(records)
+    if aggregated.empty:
+        print('⚠️ La agregación de boxscores no produjo filas válidas.')
+        return pd.DataFrame(columns=['TEAM_ID', 'GAME_ID'])
+
+    aggregated['TEAM_ID'] = pd.to_numeric(aggregated['TEAM_ID'], errors='coerce').astype('Int64')
+    aggregated['GAME_ID'] = aggregated['GAME_ID'].astype('string')
+    aggregated = aggregated.sort_values(['TEAM_ID', 'GAME_ID']).reset_index(drop=True)
+
+    for col in available_sum + available_weighted:
+        if col in aggregated.columns:
+            aggregated[col] = pd.to_numeric(aggregated[col], errors='coerce')
+
+    extra_cols = [c for c in aggregated.columns if c not in group_cols]
+    sample = ', '.join(extra_cols[:10])
+    print(
+        "Agregadas"
+        f" {len(extra_cols)} columnas desde boxscores → team_box (TEAM_ID, GAME_ID)"
+        + (f": {sample}" if sample else '')
+    )
+
+    return aggregated
+
+
 def features_baseline(df: pd.DataFrame) -> pd.DataFrame:
     """Genera métricas ROLL10_* a partir del boxscore crudo y conserva identificadores básicos."""
 
+    team_box_attr = getattr(df, 'attrs', {}).get('team_boxscores') if hasattr(df, 'attrs') else None
     df = ensure_teamid_and_date(df)
 
     required_ids = [
@@ -188,6 +362,32 @@ def features_baseline(df: pd.DataFrame) -> pd.DataFrame:
 
     df['WL_NUM'] = pd.to_numeric(df['WL_NUM'], errors='coerce')
 
+    global _TEAM_BOX_GLOBAL
+    team_box = team_box_attr if team_box_attr is not None else _TEAM_BOX_GLOBAL
+    _TEAM_BOX_GLOBAL = None
+
+    if team_box is not None and not team_box.empty:
+        team_box = ensure_teamid_and_date(team_box)
+        team_box = team_box.copy()
+        team_box['_MERGE_GAME_ID'] = team_box['GAME_ID'].astype('string')
+        merge_cols = [c for c in team_box.columns if c not in {'GAME_ID'}]
+        df['_MERGE_GAME_ID'] = df['GAME_ID'].astype('string')
+        before_cols = set(df.columns)
+        df = df.merge(
+            team_box[merge_cols],
+            on=['TEAM_ID', '_MERGE_GAME_ID'],
+            how='left',
+        )
+        df = df.drop(columns=['_MERGE_GAME_ID'], errors='ignore')
+        added_cols = sorted([c for c in df.columns if c not in before_cols])
+        if added_cols:
+            print(
+                "BASELINE: Merge team_box añadió"
+                f" {len(added_cols)} columnas -> {', '.join(added_cols[:10])}"
+            )
+    else:
+        print('⚠️ BASELINE: No se adjuntaron boxscores agregados; se mantiene el cálculo previo.')
+
     numeric_candidates = [
         'FG_PCT',
         'FG3_PCT',
@@ -201,6 +401,20 @@ def features_baseline(df: pd.DataFrame) -> pd.DataFrame:
         'FG3M',
         'FGA',
         'FTA',
+        'OFF_RATING',
+        'DEF_RATING',
+        'NET_RATING',
+        'E_OFF_RATING',
+        'E_DEF_RATING',
+        'E_NET_RATING',
+        'PACE',
+        'TM_TOV_PCT',
+        'REB_PCT',
+        'OREB_PCT',
+        'OPP_PTS_PAINT',
+        'OPP_PTS_FB',
+        'OPP_PTS_OFF_TOV',
+        'OPP_PTS_2ND_CHANCE',
     ]
 
     for col in numeric_candidates:
@@ -227,7 +441,24 @@ def features_baseline(df: pd.DataFrame) -> pd.DataFrame:
         'PLUS_MINUS',
     ]
 
-    for col in base_metrics:
+    rating_metrics = [
+        'OFF_RATING',
+        'DEF_RATING',
+        'NET_RATING',
+        'E_OFF_RATING',
+        'E_DEF_RATING',
+        'E_NET_RATING',
+        'PACE',
+        'TM_TOV_PCT',
+        'REB_PCT',
+        'OREB_PCT',
+        'OPP_PTS_PAINT',
+        'OPP_PTS_FB',
+        'OPP_PTS_OFF_TOV',
+        'OPP_PTS_2ND_CHANCE',
+    ]
+
+    for col in base_metrics + rating_metrics:
         if col in df.columns:
             metric_sources[col] = col
 
@@ -255,13 +486,15 @@ def features_baseline(df: pd.DataFrame) -> pd.DataFrame:
     roll_columns: List[str] = []
     if 'TEAM_ID' in df.columns:
         grouped = df.groupby('TEAM_ID', group_keys=False)
+
+        def _compute(series: pd.Series) -> pd.Series:
+            shifted = series.shift(1)
+            return shifted.rolling(10, min_periods=1).mean()
+
         for metric_name, source_col in metric_sources.items():
+            if source_col not in df.columns:
+                continue
             roll_col = f'ROLL10_{metric_name}'
-
-            def _compute(series: pd.Series) -> pd.Series:
-                shifted = series.shift(1)
-                return shifted.rolling(10, min_periods=1).mean()
-
             df[roll_col] = grouped[source_col].transform(_compute)
             roll_columns.append(roll_col)
 
@@ -273,6 +506,17 @@ def features_baseline(df: pd.DataFrame) -> pd.DataFrame:
     else:
         impute_roll10_inplace(df, roll_columns)
         print(f"BASELINE: Columnas ROLL10 generadas: {len(roll_columns)}")
+        rating_roll_cols = [
+            col
+            for col in roll_columns
+            if col.replace('ROLL10_', '') in rating_metrics
+        ]
+        if rating_roll_cols:
+            preview = ', '.join(sorted(rating_roll_cols)[:10])
+            print(
+                "BASELINE: ROLL10 rating/pace creadas"
+                f" ({len(rating_roll_cols)}): {preview}"
+            )
         if df['GAME_DATE'].notna().any():
             min_date = df['GAME_DATE'].min()
             max_date = df['GAME_DATE'].max()
