@@ -158,7 +158,7 @@ def features_roll10(df: pd.DataFrame) -> pd.DataFrame:
 # Baseline (ROLL10) block
 # =========================
 def features_baseline(df: pd.DataFrame) -> pd.DataFrame:
-    """Normaliza e imputa las métricas ROLL10_ manteniendo identificadores básicos."""
+    """Genera métricas ROLL10_* a partir del boxscore crudo y conserva identificadores básicos."""
 
     df = ensure_teamid_and_date(df)
 
@@ -188,9 +188,98 @@ def features_baseline(df: pd.DataFrame) -> pd.DataFrame:
 
     df['WL_NUM'] = pd.to_numeric(df['WL_NUM'], errors='coerce')
 
-    roll_cols = sorted([c for c in df.columns if c.startswith('ROLL10_')])
-    if not roll_cols:
-        raise ValueError('No se encontraron columnas con prefijo ROLL10_.')
+    numeric_candidates = [
+        'FG_PCT',
+        'FG3_PCT',
+        'FT_PCT',
+        'REB',
+        'AST',
+        'TOV',
+        'PTS',
+        'PLUS_MINUS',
+        'FGM',
+        'FG3M',
+        'FGA',
+        'FTA',
+    ]
+
+    for col in numeric_candidates:
+        if col in df.columns:
+            df[col] = pd.to_numeric(df[col], errors='coerce')
+
+    def _safe_ratio(numerator: pd.Series, denominator: pd.Series) -> pd.Series:
+        num = pd.to_numeric(numerator, errors='coerce')
+        denom = pd.to_numeric(denominator, errors='coerce').replace({0: np.nan})
+        result = num / denom
+        return result.replace([np.inf, -np.inf], np.nan)
+
+    metric_sources: Dict[str, str] = {}
+    temp_columns: List[str] = []
+
+    base_metrics = [
+        'FG_PCT',
+        'FG3_PCT',
+        'FT_PCT',
+        'REB',
+        'AST',
+        'TOV',
+        'PTS',
+        'PLUS_MINUS',
+    ]
+
+    for col in base_metrics:
+        if col in df.columns:
+            metric_sources[col] = col
+
+    if {'FGM', 'FG3M', 'FGA'}.issubset(df.columns):
+        temp_col = '__BASELINE_EFG_PCT'
+        df[temp_col] = _safe_ratio(df['FGM'] + 0.5 * df['FG3M'], df['FGA'])
+        metric_sources['EFG_PCT'] = temp_col
+        temp_columns.append(temp_col)
+
+    if {'PTS', 'FGA', 'FTA'}.issubset(df.columns):
+        temp_col = '__BASELINE_TS_PCT'
+        denominator = 2 * (df['FGA'] + 0.44 * df['FTA'])
+        df[temp_col] = _safe_ratio(df['PTS'], denominator)
+        metric_sources['TS_PCT'] = temp_col
+        temp_columns.append(temp_col)
+
+    if {'AST', 'TOV'}.issubset(df.columns):
+        temp_col = '__BASELINE_AST_TOV'
+        df[temp_col] = _safe_ratio(df['AST'], df['TOV'])
+        metric_sources['AST_TOV'] = temp_col
+        temp_columns.append(temp_col)
+
+    df = df.sort_values(['TEAM_ID', 'GAME_DATE']).reset_index(drop=True)
+
+    roll_columns: List[str] = []
+    if 'TEAM_ID' in df.columns:
+        grouped = df.groupby('TEAM_ID', group_keys=False)
+        for metric_name, source_col in metric_sources.items():
+            roll_col = f'ROLL10_{metric_name}'
+
+            def _compute(series: pd.Series) -> pd.Series:
+                shifted = series.shift(1)
+                return shifted.rolling(10, min_periods=1).mean()
+
+            df[roll_col] = grouped[source_col].transform(_compute)
+            roll_columns.append(roll_col)
+
+    for temp_col in temp_columns:
+        df = df.drop(columns=temp_col, errors='ignore')
+
+    if not roll_columns:
+        print('⚠️ BASELINE: No se pudieron generar columnas ROLL10_ a partir del boxscore disponible.')
+    else:
+        impute_roll10_inplace(df, roll_columns)
+        print(f"BASELINE: Columnas ROLL10 generadas: {len(roll_columns)}")
+        if df['GAME_DATE'].notna().any():
+            min_date = df['GAME_DATE'].min()
+            max_date = df['GAME_DATE'].max()
+            print(
+                "BASELINE: Rango de fechas procesado: "
+                f"{min_date.date()} → {max_date.date()}"
+            )
 
     id_columns = [
         'TEAM_ID',
@@ -201,15 +290,9 @@ def features_baseline(df: pd.DataFrame) -> pd.DataFrame:
         'WL_NUM',
     ]
 
-    keep_cols = id_columns + roll_cols
+    keep_cols = id_columns + sorted(roll_columns)
+    keep_cols = [col for col in keep_cols if col in df.columns]
     df = df.loc[:, keep_cols].copy()
-
-    for col in roll_cols:
-        df[col] = pd.to_numeric(df[col], errors='coerce')
-
-    df = df.sort_values(['TEAM_ID', 'GAME_DATE']).reset_index(drop=True)
-
-    impute_roll10_inplace(df, roll_cols)
 
     return df
 
@@ -1184,7 +1267,9 @@ def features_enhanced(df: pd.DataFrame, config: Dict[str, object]) -> pd.DataFra
     if 'ROLL10_PACE' in d.columns and 'PACE' not in d.columns:
         d['PACE'] = d['ROLL10_PACE']
     if 'ROLL10_TOV' in d.columns and 'ROLL10_POSS' in d.columns and 'TURNOVER_RATIO' not in d.columns:
-        ratio = d['ROLL10_TOV'] / d['ROLL10_POSS'].replace({0: np.nan})
+        numerator = pd.to_numeric(d['ROLL10_TOV'], errors='coerce')
+        denominator = pd.to_numeric(d['ROLL10_POSS'], errors='coerce')
+        ratio = numerator / denominator.replace({0: np.nan})
         d['TURNOVER_RATIO'] = ratio.replace([np.inf, -np.inf], np.nan)
 
     # Detecta temporada si existe
