@@ -23,11 +23,11 @@ def _print_feature_delta(
 
 def load_feature_module() -> object:
     base_path = Path(__file__).resolve()
-    module_path = base_path.with_name('02_FeatureFunctions.py')
+    module_path = base_path.with_name('02_BuildFeaturized_Functions.py')
     if not module_path.exists():
         raise FileNotFoundError(f'No se encontró el módulo de features: {module_path}')
 
-    spec = importlib.util.spec_from_file_location('feature_functions', module_path)
+    spec = importlib.util.spec_from_file_location('buildfeaturized_functions', module_path)
     if spec is None or spec.loader is None:
         raise ImportError(f'No se pudo cargar el spec para {module_path}')
 
